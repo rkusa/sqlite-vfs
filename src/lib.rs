@@ -17,9 +17,19 @@ use std::time::Duration;
 
 use rusqlite::{ffi, OpenFlags};
 
+pub trait File: Read + Seek {
+    fn file_size(&self) -> Result<u64, std::io::Error>;
+}
+
 pub trait Vfs {
-    type File: Read + Seek;
+    type File: File;
+
     fn open(&self, path: &Path) -> Result<Self::File, std::io::Error>;
+    fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
+
+    fn access(&self, path: &Path) -> Result<bool, std::io::Error> {
+        Ok(true)
+    }
 }
 
 struct State<V> {
@@ -27,7 +37,7 @@ struct State<V> {
     io_methods: ffi::sqlite3_io_methods,
 }
 
-pub fn register<F: Read + Seek, V: Vfs<File = F>>(name: &str, vfs: V) {
+pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
     let name = ManuallyDrop::new(CString::new(name).unwrap());
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 1,
@@ -36,7 +46,7 @@ pub fn register<F: Read + Seek, V: Vfs<File = F>>(name: &str, vfs: V) {
         xWrite: Some(io::write),
         xTruncate: Some(io::truncate),
         xSync: Some(io::sync),
-        xFileSize: Some(io::file_size),
+        xFileSize: Some(io::file_size::<F>),
         xLock: Some(io::lock),
         xUnlock: Some(io::unlock),
         xCheckReservedLock: Some(io::check_reserved_lock),
@@ -55,14 +65,14 @@ pub fn register<F: Read + Seek, V: Vfs<File = F>>(name: &str, vfs: V) {
     let ptr = Box::into_raw(Box::new(State { vfs, io_methods }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: 1,
-        szOsFile: size_of::<File<F>>() as i32,
+        szOsFile: size_of::<FileState<F>>() as i32,
         mxPathname: MAX_PATH_LENGTH as i32, // max path length supported by VFS
         pNext: null_mut(),
         zName: name.as_ptr(),
         pAppData: ptr as _,
         xOpen: Some(vfs::open::<F, V>),
-        xDelete: Some(vfs::delete),
-        xAccess: Some(vfs::access),
+        xDelete: Some(vfs::delete::<V>),
+        xAccess: Some(vfs::access::<V>),
         xFullPathname: Some(vfs::full_pathname),
         xDlOpen: Some(vfs::dlopen),
         xDlError: Some(vfs::dlerror),
@@ -89,15 +99,17 @@ const MAX_PATH_LENGTH: usize = 512;
 const BLOCK_SIZE: usize = 4096;
 
 #[repr(C)]
-struct File<F> {
+struct FileState<F> {
     base: ffi::sqlite3_file,
     file: *mut F,
 }
 
 mod vfs {
+    use std::io::ErrorKind;
+
     use super::*;
 
-    pub unsafe extern "C" fn open<F: Read + Seek, V: Vfs<File = F>>(
+    pub unsafe extern "C" fn open<F: File, V: Vfs<File = F>>(
         p_vfs: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
         mut out_file: *mut ffi::sqlite3_file,
@@ -111,12 +123,6 @@ mod vfs {
         };
         println!("open z_name={:?} flags={}", name, flags);
 
-        // TODO: proper errors
-        // TODO: other name and flags
-        // assert_eq!(name, Some("main.db3"));
-        // assert!((flags & OpenFlags::SQLITE_OPEN_READ_WRITE.bits()) > 0,);
-        // assert!((flags & OpenFlags::SQLITE_OPEN_CREATE.bits()) > 0,);
-
         let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().expect("vfs is null");
         let mut state: std::ptr::NonNull<State<V>> =
             NonNull::new(vfs.pAppData as _).expect("pAppData is null");
@@ -128,36 +134,79 @@ mod vfs {
         match state.vfs.open(osstr.as_ref()) {
             Ok(f) => {
                 // TODO: p_out_flags?
-                let mut out_file = NonNull::new(out_file as *mut File<F>).unwrap();
+                let mut out_file = NonNull::new(out_file as *mut FileState<F>).unwrap();
                 let out_file = out_file.as_mut();
                 out_file.base.pMethods = &state.io_methods;
                 out_file.file = Box::into_raw(Box::new(f));
 
                 ffi::SQLITE_OK
             }
-            Err(err) => panic!("failed to open: {}", err),
+            Err(_) => ffi::SQLITE_CANTOPEN,
         }
     }
 
-    pub unsafe extern "C" fn delete(
+    pub unsafe extern "C" fn delete<V: Vfs>(
         arg1: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
         sync_dir: c_int,
     ) -> c_int {
-        println!("delete");
+        let name = if z_name.is_null() {
+            None
+        } else {
+            CStr::from_ptr(z_name).to_str().ok()
+        };
+        println!("delete z_name={:?}", name);
 
-        todo!("delete")
+        let vfs: &mut ffi::sqlite3_vfs = arg1.as_mut().unwrap();
+        let mut state: std::ptr::NonNull<State<V>> =
+            NonNull::new(vfs.pAppData as _).expect("pAppData is null");
+        let state = state.as_mut();
+
+        let slice = CStr::from_ptr(z_name);
+        let osstr = OsStr::from_bytes(slice.to_bytes());
+
+        match state.vfs.delete(osstr.as_ref()) {
+            Ok(_) => ffi::SQLITE_OK,
+            Err(err) => {
+                if err.kind() == ErrorKind::NotFound {
+                    ffi::SQLITE_OK
+                } else {
+                    ffi::SQLITE_DELETE
+                }
+            }
+        }
     }
 
-    pub unsafe extern "C" fn access(
+    pub unsafe extern "C" fn access<V: Vfs>(
         arg1: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
         flags: c_int,
         p_res_out: *mut c_int,
     ) -> c_int {
-        println!("access");
+        let name = if z_name.is_null() {
+            None
+        } else {
+            CStr::from_ptr(z_name).to_str().ok()
+        };
+        println!("access z_name={:?} flags={}", name, flags);
 
-        todo!("access")
+        let vfs: &mut ffi::sqlite3_vfs = arg1.as_mut().unwrap();
+        let mut state: std::ptr::NonNull<State<V>> =
+            NonNull::new(vfs.pAppData as _).expect("pAppData is null");
+        let state = state.as_mut();
+
+        let slice = CStr::from_ptr(z_name);
+        let osstr = OsStr::from_bytes(slice.to_bytes());
+
+        match state.vfs.access(osstr.as_ref()) {
+            Ok(ok) => {
+                let p_res_out: &mut c_int = p_res_out.as_mut().unwrap();
+                *p_res_out = ok as i32;
+
+                ffi::SQLITE_OK
+            }
+            Err(_err) => ffi::SQLITE_IOERR_ACCESS,
+        }
     }
 
     pub unsafe extern "C" fn full_pathname(
@@ -266,14 +315,14 @@ mod io {
         println!("close");
 
         let mut f = NonNull::new(arg1 as _).unwrap();
-        let f: &mut File<F> = f.as_mut();
+        let f: &mut FileState<F> = f.as_mut();
         Box::from_raw(f.file);
         f.file = null_mut();
 
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn read<F: Read + Seek>(
+    pub unsafe extern "C" fn read<F: File>(
         arg1: *mut ffi::sqlite3_file,
         arg2: *mut c_void,
         i_amt: c_int,
@@ -282,7 +331,7 @@ mod io {
         println!("read offset={} len={}", i_ofst, i_amt);
 
         let mut f = NonNull::new(arg1 as _).unwrap();
-        let f: &mut File<F> = f.as_mut();
+        let f: &mut FileState<F> = f.as_mut();
         let f: &mut F = f.file.as_mut().unwrap();
 
         match f.seek(SeekFrom::Start(i_ofst as u64)) {
@@ -329,12 +378,24 @@ mod io {
         todo!("sync");
     }
 
-    pub unsafe extern "C" fn file_size(
+    pub unsafe extern "C" fn file_size<F: File>(
         arg1: *mut ffi::sqlite3_file,
         p_size: *mut ffi::sqlite3_int64,
     ) -> c_int {
         println!("file_size");
-        todo!("file_size");
+
+        let mut f = NonNull::new(arg1 as _).unwrap();
+        let f: &mut FileState<F> = f.as_mut();
+        let f: &mut F = f.file.as_mut().unwrap();
+
+        let file_size = match f.file_size() {
+            Ok(n) => n,
+            Err(_) => return ffi::SQLITE_IOERR_FSTAT,
+        };
+        let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().unwrap();
+        *p_size = file_size as ffi::sqlite3_int64;
+
+        ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn lock(arg1: *mut ffi::sqlite3_file, arg2: c_int) -> c_int {
@@ -354,7 +415,12 @@ mod io {
         p_res_out: *mut c_int,
     ) -> c_int {
         println!("check_reserved_lock");
-        todo!("check_reserved_lock");
+
+        let p_res_out: &mut c_int = p_res_out.as_mut().unwrap();
+        *p_res_out = false as i32;
+
+        // TODO: implement locking
+        ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn file_control(
@@ -382,8 +448,14 @@ mod io {
     }
 }
 
-impl<F> Drop for File<F> {
+impl<F> Drop for FileState<F> {
     fn drop(&mut self) {
         unsafe { Box::from_raw(self.file) };
+    }
+}
+
+impl File for std::fs::File {
+    fn file_size(&self) -> Result<u64, std::io::Error> {
+        Ok(self.metadata()?.len())
     }
 }

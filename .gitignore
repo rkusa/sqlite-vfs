@@ -3,4 +3,4 @@
 /target
 wasm-pack.log
 build/
-*.db3
+/db
