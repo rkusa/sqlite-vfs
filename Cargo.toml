@@ -1,0 +1,10 @@
+[package]
+name = "sqlite-vfs"
+version = "0.1.0"
+authors = ["Markus Ast <m@rkusa.st>"]
+edition = "2021"
+
+[dependencies]
+rusqlite = { git = "https://github.com/trevyn/rusqlite.git", branch = "wasm32-unknown-unknown", features = ["bundled", "wasm32-wasi-vfs"] }
+rand = "0.8"
+time = { version = "0.3" }
