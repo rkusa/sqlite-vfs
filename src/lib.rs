@@ -97,15 +97,19 @@ struct FileState<F> {
     file: *mut F,
 }
 
+// Example mem-fs implementation:
+// https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c
 mod vfs {
     use std::io::ErrorKind;
+    use std::time::Instant;
 
     use super::*;
 
+    /// Open a new file handler.
     pub unsafe extern "C" fn open<F: File, V: Vfs<File = F>>(
         p_vfs: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
-        out_file: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         flags: c_int,
         _p_out_flags: *mut c_int,
     ) -> c_int {
@@ -127,7 +131,7 @@ mod vfs {
         match state.vfs.open(osstr.as_ref()) {
             Ok(f) => {
                 // TODO: p_out_flags?
-                let mut out_file = NonNull::new(out_file as *mut FileState<F>).unwrap();
+                let mut out_file = NonNull::new(p_file as *mut FileState<F>).unwrap();
                 let out_file = out_file.as_mut();
                 out_file.base.pMethods = &state.io_methods;
                 out_file.file = Box::into_raw(Box::new(f));
@@ -138,24 +142,26 @@ mod vfs {
         }
     }
 
+    /// Delete the file located at `z_path`. If the `sync_dir` argument is true, ensure the
+    /// file-system modifications are synced to disk before returning.
     pub unsafe extern "C" fn delete<V: Vfs>(
-        arg1: *mut ffi::sqlite3_vfs,
-        z_name: *const c_char,
-        _sync_dir: c_int, // TODO: sync_dir
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const c_char,
+        _sync_dir: c_int,
     ) -> c_int {
-        let name = if z_name.is_null() {
+        let name = if z_path.is_null() {
             None
         } else {
-            CStr::from_ptr(z_name).to_str().ok()
+            CStr::from_ptr(z_path).to_str().ok()
         };
         println!("delete z_name={:?}", name);
 
-        let vfs: &mut ffi::sqlite3_vfs = arg1.as_mut().unwrap();
+        let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().unwrap();
         let mut state: std::ptr::NonNull<State<V>> =
             NonNull::new(vfs.pAppData as _).expect("pAppData is null");
         let state = state.as_mut();
 
-        let slice = CStr::from_ptr(z_name);
+        let slice = CStr::from_ptr(z_path);
         let osstr = OsStr::from_bytes(slice.to_bytes());
 
         match state.vfs.delete(osstr.as_ref()) {
@@ -170,25 +176,27 @@ mod vfs {
         }
     }
 
+    /// Test for access permissions. Return true if the requested permission is available, or false
+    /// otherwise.
     pub unsafe extern "C" fn access<V: Vfs>(
-        arg1: *mut ffi::sqlite3_vfs,
-        z_name: *const c_char,
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const c_char,
         flags: c_int,
         p_res_out: *mut c_int,
     ) -> c_int {
-        let name = if z_name.is_null() {
+        let name = if z_path.is_null() {
             None
         } else {
-            CStr::from_ptr(z_name).to_str().ok()
+            CStr::from_ptr(z_path).to_str().ok()
         };
         println!("access z_name={:?} flags={}", name, flags);
 
-        let vfs: &mut ffi::sqlite3_vfs = arg1.as_mut().unwrap();
+        let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().unwrap();
         let mut state: std::ptr::NonNull<State<V>> =
             NonNull::new(vfs.pAppData as _).expect("pAppData is null");
         let state = state.as_mut();
 
-        let slice = CStr::from_ptr(z_name);
+        let slice = CStr::from_ptr(z_path);
         let osstr = OsStr::from_bytes(slice.to_bytes());
 
         match state.vfs.access(osstr.as_ref()) {
@@ -202,33 +210,40 @@ mod vfs {
         }
     }
 
+    /// Populate buffer `z_out` with the full canonical pathname corresponding to the pathname in
+    /// `z_path`. `z_out` is guaranteed to point to a buffer of at least (INST_MAX_PATHNAME+1)
+    /// bytes.
     pub unsafe extern "C" fn full_pathname(
-        _arg1: *mut ffi::sqlite3_vfs,
-        z_name: *const c_char,
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const c_char,
         n_out: c_int,
         z_out: *mut c_char,
     ) -> c_int {
-        let name = CStr::from_ptr(z_name);
+        let name = CStr::from_ptr(z_path);
         println!("full_pathname name={}", name.to_string_lossy());
         let name = name.to_bytes_with_nul();
         assert!(name.len() <= n_out as usize); // TODO: proper error
+        assert!(name.len() <= MAX_PATH_LENGTH); // TODO: proper error
         let out = slice::from_raw_parts_mut(z_out as *mut u8, name.len());
         out.copy_from_slice(name);
 
         ffi::SQLITE_OK
     }
 
+    /// Open the dynamic library located at `z_path` and return a handle.
     pub unsafe extern "C" fn dlopen(
-        _arg1: *mut ffi::sqlite3_vfs,
-        _z_filename: *const c_char,
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        _z_path: *const c_char,
     ) -> *mut c_void {
         println!("dlopen");
 
         null_mut()
     }
 
+    /// Populate the buffer `z_err_msg` (size `n_byte` bytes) with a human readable utf-8 string
+    /// describing the most recent error encountered associated with dynamic libraries.
     pub unsafe extern "C" fn dlerror(
-        _arg1: *mut ffi::sqlite3_vfs,
+        _p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
         z_err_msg: *mut c_char,
     ) {
@@ -238,51 +253,55 @@ mod vfs {
         ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr());
     }
 
+    /// Return a pointer to the symbol `z_sym` in the dynamic library pHandle.
     pub unsafe extern "C" fn dlsym(
-        _arg1: *mut ffi::sqlite3_vfs,
-        _arg2: *mut c_void,
-        _z_symbol: *const c_char,
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        _p: *mut c_void,
+        _z_sym: *const c_char,
     ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const i8)> {
         println!("dlsym");
 
         None
     }
 
-    pub unsafe extern "C" fn dlclose(_arg1: *mut ffi::sqlite3_vfs, _arg2: *mut c_void) {
+    /// Close the dynamic library handle `p_handle`.
+    pub unsafe extern "C" fn dlclose(_p_vfs: *mut ffi::sqlite3_vfs, _p_handle: *mut c_void) {
         println!("dlclose");
     }
 
-    /// Write `n_bytes` bytes of good-quality randomness into `z_out`. Return the number of bytes of
-    /// randomness obtained.
+    /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
     pub unsafe extern "C" fn randomness(
-        _arg1: *mut ffi::sqlite3_vfs,
+        _p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
-        z_out: *mut c_char,
+        z_buf_out: *mut c_char,
     ) -> c_int {
         println!("randomness");
 
         use rand::Rng;
 
-        let bytes = slice::from_raw_parts_mut(z_out, n_byte as usize);
+        let bytes = slice::from_raw_parts_mut(z_buf_out, n_byte as usize);
         rand::thread_rng().fill(bytes);
         bytes.len() as c_int
     }
 
-    /// Sleep for at least the number of microseconds given. Return the approximate number of
-    /// microseconds slept for.
-    pub unsafe extern "C" fn sleep(_arg1: *mut ffi::sqlite3_vfs, microseconds: c_int) -> c_int {
+    /// Sleep for `n_micro` microseconds. Return the number of microseconds actually slept.
+    pub unsafe extern "C" fn sleep(_p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
         println!("sleep");
 
-        thread::sleep(Duration::from_micros(microseconds as u64));
-        ffi::SQLITE_OK
+        let instant = Instant::now();
+        thread::sleep(Duration::from_micros(n_micro as u64));
+        instant.elapsed().as_micros() as c_int
     }
 
-    /// Returns a Julian Day Number for the current date and time as a floating point value.
-    pub unsafe extern "C" fn current_time(_arg1: *mut ffi::sqlite3_vfs, arg2: *mut f64) -> c_int {
+    /// Return the current time as a Julian Day number in `p_time_out`.
+    pub unsafe extern "C" fn current_time(
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        p_time_out: *mut f64,
+    ) -> c_int {
         println!("current_time");
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        *arg2 = 2440587.5 + now / 864.0e5;
+        *p_time_out = 2440587.5 + now / 864.0e5;
         ffi::SQLITE_OK
     }
 
@@ -292,35 +311,36 @@ mod vfs {
         _z_err_msg: *mut c_char,
     ) -> c_int {
         todo!("get_last_error")
-
-        // let msg = CString::new("Loadable extensions are not supported").unwrap();
-        // ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr());
     }
 }
 
 mod io {
     use super::*;
 
-    pub unsafe extern "C" fn close<F>(arg1: *mut ffi::sqlite3_file) -> c_int {
+    /// Close a file.
+    pub unsafe extern "C" fn close<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("close");
 
-        let mut f = NonNull::new(arg1 as _).unwrap();
+        let mut f = NonNull::new(p_file as _).unwrap();
         let f: &mut FileState<F> = f.as_mut();
+
+        // TODO: only when free on close is set?
         Box::from_raw(f.file);
         f.file = null_mut();
 
         ffi::SQLITE_OK
     }
 
+    /// Read data from a file.
     pub unsafe extern "C" fn read<F: File>(
-        arg1: *mut ffi::sqlite3_file,
-        arg2: *mut c_void,
+        p_file: *mut ffi::sqlite3_file,
+        z_buf: *mut c_void,
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
         println!("read offset={} len={}", i_ofst, i_amt);
 
-        let mut f = NonNull::new(arg1 as _).unwrap();
+        let mut f = NonNull::new(p_file as _).unwrap();
         let f: &mut FileState<F> = f.as_mut();
         let f: &mut F = f.file.as_mut().unwrap();
 
@@ -333,7 +353,7 @@ mod io {
             Err(_) => return ffi::SQLITE_IOERR_READ,
         }
 
-        let out = slice::from_raw_parts_mut(arg2 as *mut u8, i_amt as usize);
+        let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
         if let Err(err) = f.read_exact(out) {
             if err.kind() == ErrorKind::UnexpectedEof {
                 return ffi::SQLITE_IOERR_SHORT_READ;
@@ -345,15 +365,16 @@ mod io {
         ffi::SQLITE_OK
     }
 
+    /// Write data to a file.
     pub unsafe extern "C" fn write<F: File>(
-        arg1: *mut ffi::sqlite3_file,
-        arg2: *const c_void,
+        p_file: *mut ffi::sqlite3_file,
+        z: *const c_void,
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
         println!("write offset={} len={}", i_ofst, i_amt);
 
-        let mut f = NonNull::new(arg1 as _).unwrap();
+        let mut f = NonNull::new(p_file as _).unwrap();
         let f: &mut FileState<F> = f.as_mut();
         let f: &mut F = f.file.as_mut().unwrap();
 
@@ -366,7 +387,7 @@ mod io {
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         }
 
-        let data = slice::from_raw_parts(arg2 as *mut u8, i_amt as usize);
+        let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
         if f.write_all(data).is_err() {
             return ffi::SQLITE_IOERR_WRITE;
         }
@@ -374,19 +395,20 @@ mod io {
         ffi::SQLITE_OK
     }
 
+    /// Truncate a file.
     pub unsafe extern "C" fn truncate(
-        _arg1: *mut ffi::sqlite3_file,
+        _p_file: *mut ffi::sqlite3_file,
         _size: ffi::sqlite3_int64,
     ) -> c_int {
         println!("truncate");
         todo!("truncate");
     }
 
-    /// Persist changes to file.
-    pub unsafe extern "C" fn sync<F: File>(arg1: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
+    /// Persist changes to a file.
+    pub unsafe extern "C" fn sync<F: File>(p_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
         println!("sync");
 
-        let mut f = NonNull::new(arg1 as _).unwrap();
+        let mut f = NonNull::new(p_file as _).unwrap();
         let f: &mut FileState<F> = f.as_mut();
         let f: &mut F = f.file.as_mut().unwrap();
 
@@ -397,13 +419,14 @@ mod io {
         ffi::SQLITE_OK
     }
 
+    /// Return the current file-size of a file.
     pub unsafe extern "C" fn file_size<F: File>(
-        arg1: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         p_size: *mut ffi::sqlite3_int64,
     ) -> c_int {
         println!("file_size");
 
-        let mut f = NonNull::new(arg1 as _).unwrap();
+        let mut f = NonNull::new(p_file as _).unwrap();
         let f: &mut FileState<F> = f.as_mut();
         let f: &mut F = f.file.as_mut().unwrap();
 
@@ -417,20 +440,23 @@ mod io {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn lock(_arg1: *mut ffi::sqlite3_file, _arg2: c_int) -> c_int {
+    /// Lock a file.
+    pub unsafe extern "C" fn lock(_p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
         println!("lock");
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn unlock(_arg1: *mut ffi::sqlite3_file, _arg2: c_int) -> c_int {
+    /// Unlock a file.
+    pub unsafe extern "C" fn unlock(_p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
         println!("unlock");
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
+    /// Check if another file-handle holds a RESERVED lock on a file.
     pub unsafe extern "C" fn check_reserved_lock(
-        _arg1: *mut ffi::sqlite3_file,
+        _p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
         println!("check_reserved_lock");
@@ -442,28 +468,41 @@ mod io {
         ffi::SQLITE_OK
     }
 
+    /// File control method. For custom operations on an mem-file.
     pub unsafe extern "C" fn file_control(
-        _arg1: *mut ffi::sqlite3_file,
-        _op: c_int,
+        _p_file: *mut ffi::sqlite3_file,
+        op: c_int,
         _p_arg: *mut c_void,
     ) -> c_int {
-        println!("file_control");
-        ffi::SQLITE_OK
+        println!("file_control op={}", op);
+        ffi::SQLITE_NOTFOUND
     }
 
-    /// Returns the sector size of the device that underlies the file.
-    pub unsafe extern "C" fn sector_size(_arg1: *mut ffi::sqlite3_file) -> c_int {
+    /// Return the sector-size in bytes for a file.
+    pub unsafe extern "C" fn sector_size(_p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("sector_size");
 
         1
     }
 
-    pub unsafe extern "C" fn device_characteristics(_arg1: *mut ffi::sqlite3_file) -> c_int {
+    /// Return the device characteristic flags supported by a file.
+    pub unsafe extern "C" fn device_characteristics(_p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("device_characteristics");
 
-        // TODO: evaluate which flags make sense to activate
+        // For now, simply copied from [memfs] without putting in a lot of thought.
+        // [memfs]: (https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c#L271-L276)
+
         // writes of any size are atomic
-        ffi::SQLITE_IOCAP_ATOMIC
+        ffi::SQLITE_IOCAP_ATOMIC |
+        // after reboot following a crash or power loss, the only bytes in a file that were written
+        // at the application level might have changed and that adjacent bytes, even bytes within
+        // the same sector are guaranteed to be unchanged
+        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE |
+        // when data is appended to a file, the data is appended first then the size of the file is
+        // extended, never the other way around
+        ffi::SQLITE_IOCAP_SAFE_APPEND |
+        // information is written to disk in the same order as calls to xWrite()
+        ffi::SQLITE_IOCAP_SEQUENTIAL
     }
 }
 
