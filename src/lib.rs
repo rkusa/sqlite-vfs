@@ -3,7 +3,7 @@
 use core::slice;
 use std::ffi::OsStr;
 use std::ffi::{c_void, CStr, CString};
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::mem;
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int};
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use rusqlite::{ffi, OpenFlags};
 
-pub trait File: Read + Seek {
+pub trait File: Read + Seek + Write {
     fn file_size(&self) -> Result<u64, std::io::Error>;
 }
 
@@ -43,9 +43,9 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
         iVersion: 1,
         xClose: Some(io::close::<F>),
         xRead: Some(io::read::<F>),
-        xWrite: Some(io::write),
+        xWrite: Some(io::write::<F>),
         xTruncate: Some(io::truncate),
-        xSync: Some(io::sync),
+        xSync: Some(io::sync::<F>),
         xFileSize: Some(io::file_size::<F>),
         xLock: Some(io::lock),
         xUnlock: Some(io::unlock),
@@ -306,7 +306,7 @@ mod vfs {
 }
 
 mod io {
-    use std::io::{ErrorKind, SeekFrom};
+    use std::io::{ErrorKind, SeekFrom, Write};
     use std::ptr::null;
 
     use super::*;
@@ -355,14 +355,33 @@ mod io {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn write(
+    pub unsafe extern "C" fn write<F: File>(
         arg1: *mut ffi::sqlite3_file,
         arg2: *const c_void,
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
-        println!("write");
-        todo!("write");
+        println!("write offset={} len={}", i_ofst, i_amt);
+
+        let mut f = NonNull::new(arg1 as _).unwrap();
+        let f: &mut FileState<F> = f.as_mut();
+        let f: &mut F = f.file.as_mut().unwrap();
+
+        match f.seek(SeekFrom::Start(i_ofst as u64)) {
+            Ok(o) => {
+                if o != i_ofst as u64 {
+                    return ffi::SQLITE_IOERR_WRITE;
+                }
+            }
+            Err(_) => return ffi::SQLITE_IOERR_WRITE,
+        }
+
+        let data = slice::from_raw_parts(arg2 as *mut u8, i_amt as usize);
+        if f.write_all(data).is_err() {
+            return ffi::SQLITE_IOERR_WRITE;
+        }
+
+        ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn truncate(
@@ -373,9 +392,19 @@ mod io {
         todo!("truncate");
     }
 
-    pub unsafe extern "C" fn sync(arg1: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
+    /// Persist changes to file.
+    pub unsafe extern "C" fn sync<F: File>(arg1: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
         println!("sync");
-        todo!("sync");
+
+        let mut f = NonNull::new(arg1 as _).unwrap();
+        let f: &mut FileState<F> = f.as_mut();
+        let f: &mut F = f.file.as_mut().unwrap();
+
+        if f.flush().is_err() {
+            return ffi::SQLITE_IOERR_FSYNC;
+        }
+
+        ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn file_size<F: File>(

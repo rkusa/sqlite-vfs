@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use rusqlite::{Connection, OpenFlags};
 use sqlite_vfs::{register, Vfs};
 
-struct TestVfs {}
+struct TestVfs;
 
 impl Vfs for TestVfs {
     type File = File;
@@ -24,7 +24,7 @@ impl Vfs for TestVfs {
 }
 
 fn main() {
-    register("test", TestVfs {});
+    register("test", TestVfs);
 
     let conn = Connection::open_with_flags_and_vfs(
         "db/main.db3",
