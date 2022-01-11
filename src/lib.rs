@@ -1,21 +1,15 @@
-#![allow(unused)]
-
 use core::slice;
-use std::ffi::OsStr;
-use std::ffi::{c_void, CStr, CString};
-use std::io::{Read, Seek, Write};
-use std::mem;
+use std::ffi::{c_void, CStr, CString, OsStr};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int};
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
-use std::pin::Pin;
-use std::ptr::null_mut;
-use std::ptr::NonNull;
+use std::ptr::{null_mut, NonNull};
 use std::thread;
 use std::time::Duration;
 
-use rusqlite::{ffi, OpenFlags};
+use rusqlite::ffi;
 
 pub trait File: Read + Seek + Write {
     fn file_size(&self) -> Result<u64, std::io::Error>;
@@ -27,7 +21,7 @@ pub trait Vfs {
     fn open(&self, path: &Path) -> Result<Self::File, std::io::Error>;
     fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
 
-    fn access(&self, path: &Path) -> Result<bool, std::io::Error> {
+    fn access(&self, _path: &Path) -> Result<bool, std::io::Error> {
         Ok(true)
     }
 }
@@ -96,7 +90,6 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
 }
 
 const MAX_PATH_LENGTH: usize = 512;
-const BLOCK_SIZE: usize = 4096;
 
 #[repr(C)]
 struct FileState<F> {
@@ -112,9 +105,9 @@ mod vfs {
     pub unsafe extern "C" fn open<F: File, V: Vfs<File = F>>(
         p_vfs: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
-        mut out_file: *mut ffi::sqlite3_file,
+        out_file: *mut ffi::sqlite3_file,
         flags: c_int,
-        p_out_flags: *mut c_int,
+        _p_out_flags: *mut c_int,
     ) -> c_int {
         let name = if z_name.is_null() {
             None
@@ -148,7 +141,7 @@ mod vfs {
     pub unsafe extern "C" fn delete<V: Vfs>(
         arg1: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
-        sync_dir: c_int,
+        _sync_dir: c_int, // TODO: sync_dir
     ) -> c_int {
         let name = if z_name.is_null() {
             None
@@ -210,7 +203,7 @@ mod vfs {
     }
 
     pub unsafe extern "C" fn full_pathname(
-        arg1: *mut ffi::sqlite3_vfs,
+        _arg1: *mut ffi::sqlite3_vfs,
         z_name: *const c_char,
         n_out: c_int,
         z_out: *mut c_char,
@@ -294,9 +287,9 @@ mod vfs {
     }
 
     pub unsafe extern "C" fn get_last_error(
-        arg1: *mut ffi::sqlite3_vfs,
-        n_byte: c_int,
-        z_err_msg: *mut c_char,
+        _arg1: *mut ffi::sqlite3_vfs,
+        _n_byte: c_int,
+        _z_err_msg: *mut c_char,
     ) -> c_int {
         todo!("get_last_error")
 
@@ -306,9 +299,6 @@ mod vfs {
 }
 
 mod io {
-    use std::io::{ErrorKind, SeekFrom, Write};
-    use std::ptr::null;
-
     use super::*;
 
     pub unsafe extern "C" fn close<F>(arg1: *mut ffi::sqlite3_file) -> c_int {
@@ -385,15 +375,15 @@ mod io {
     }
 
     pub unsafe extern "C" fn truncate(
-        arg1: *mut ffi::sqlite3_file,
-        size: ffi::sqlite3_int64,
+        _arg1: *mut ffi::sqlite3_file,
+        _size: ffi::sqlite3_int64,
     ) -> c_int {
         println!("truncate");
         todo!("truncate");
     }
 
     /// Persist changes to file.
-    pub unsafe extern "C" fn sync<F: File>(arg1: *mut ffi::sqlite3_file, flags: c_int) -> c_int {
+    pub unsafe extern "C" fn sync<F: File>(arg1: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
         println!("sync");
 
         let mut f = NonNull::new(arg1 as _).unwrap();
@@ -427,20 +417,20 @@ mod io {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn lock(arg1: *mut ffi::sqlite3_file, arg2: c_int) -> c_int {
+    pub unsafe extern "C" fn lock(_arg1: *mut ffi::sqlite3_file, _arg2: c_int) -> c_int {
         println!("lock");
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn unlock(arg1: *mut ffi::sqlite3_file, arg2: c_int) -> c_int {
+    pub unsafe extern "C" fn unlock(_arg1: *mut ffi::sqlite3_file, _arg2: c_int) -> c_int {
         println!("unlock");
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
     pub unsafe extern "C" fn check_reserved_lock(
-        arg1: *mut ffi::sqlite3_file,
+        _arg1: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
         println!("check_reserved_lock");
@@ -453,22 +443,22 @@ mod io {
     }
 
     pub unsafe extern "C" fn file_control(
-        arg1: *mut ffi::sqlite3_file,
-        op: c_int,
-        p_arg: *mut c_void,
+        _arg1: *mut ffi::sqlite3_file,
+        _op: c_int,
+        _p_arg: *mut c_void,
     ) -> c_int {
         println!("file_control");
         ffi::SQLITE_OK
     }
 
     /// Returns the sector size of the device that underlies the file.
-    pub unsafe extern "C" fn sector_size(arg1: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn sector_size(_arg1: *mut ffi::sqlite3_file) -> c_int {
         println!("sector_size");
 
         1
     }
 
-    pub unsafe extern "C" fn device_characteristics(arg1: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn device_characteristics(_arg1: *mut ffi::sqlite3_file) -> c_int {
         println!("device_characteristics");
 
         // TODO: evaluate which flags make sense to activate
