@@ -24,7 +24,7 @@ impl Vfs for TestVfs {
 }
 
 fn main() {
-    register("test", TestVfs);
+    register("test", TestVfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
         "db/main.db3",

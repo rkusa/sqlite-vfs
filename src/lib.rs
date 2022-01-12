@@ -1,13 +1,16 @@
 use core::slice;
+use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString, OsStr};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int};
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
-use std::ptr::{null_mut, NonNull};
+use std::ptr::null_mut;
+use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use rusqlite::ffi;
 
@@ -33,10 +36,11 @@ pub trait Vfs {
 struct State<V> {
     vfs: V,
     io_methods: ffi::sqlite3_io_methods,
+    last_error: Rc<Cell<Option<std::io::Error>>>,
 }
 
-pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
-    let name = ManuallyDrop::new(CString::new(name).unwrap());
+pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), std::ffi::NulError> {
+    let name = ManuallyDrop::new(CString::new(name)?);
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 3,
         xClose: Some(io::close::<F>),
@@ -58,7 +62,11 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
         xFetch: Some(io::mem_fetch::<F>),
         xUnfetch: Some(io::mem_unfetch),
     };
-    let ptr = Box::into_raw(Box::new(State { vfs, io_methods }));
+    let ptr = Box::into_raw(Box::new(State {
+        vfs,
+        io_methods,
+        last_error: Default::default(),
+    }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: 3,
         szOsFile: size_of::<FileState<F>>() as i32,
@@ -90,6 +98,8 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
     }
 
     // TODO: return object that allows to unregister (and cleanup the memory)
+
+    Ok(())
 }
 
 const MAX_PATH_LENGTH: usize = 512;
@@ -98,13 +108,12 @@ const MAX_PATH_LENGTH: usize = 512;
 struct FileState<F> {
     base: ffi::sqlite3_file,
     file: *mut F,
+    last_error: *const Cell<Option<std::io::Error>>,
 }
 
 // Example mem-fs implementation:
 // https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c
 mod vfs {
-    use std::io::ErrorKind;
-    use std::time::Instant;
 
     use super::*;
 
@@ -123,26 +132,29 @@ mod vfs {
         };
         println!("open z_name={:?} flags={}", name, flags);
 
-        let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().expect("vfs is null");
-        let mut state: std::ptr::NonNull<State<V>> =
-            NonNull::new(vfs.pAppData as _).expect("pAppData is null");
-        let state = state.as_mut();
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
 
         let slice = CStr::from_ptr(z_name);
         let osstr = OsStr::from_bytes(slice.to_bytes());
 
-        match state.vfs.open(osstr.as_ref()) {
-            Ok(f) => {
-                // TODO: p_out_flags?
-                let mut out_file = NonNull::new(p_file as *mut FileState<F>).unwrap();
-                let out_file = out_file.as_mut();
-                out_file.base.pMethods = &state.io_methods;
-                out_file.file = Box::into_raw(Box::new(f));
-
-                ffi::SQLITE_OK
-            }
-            Err(_) => ffi::SQLITE_CANTOPEN,
+        if let Err(err) = state.vfs.open(osstr.as_ref()).and_then(|f| {
+            let out_file = (p_file as *mut FileState<F>)
+                .as_mut()
+                .ok_or_else(null_ptr_error)?;
+            out_file.base.pMethods = &state.io_methods;
+            out_file.file = Box::into_raw(Box::new(f));
+            out_file.last_error = Rc::into_raw(Rc::clone(&state.last_error));
+            Ok(())
+        }) {
+            state.last_error.set(Some(err));
+            return ffi::SQLITE_CANTOPEN;
         }
+
+        ffi::SQLITE_OK
     }
 
     /// Delete the file located at `z_path`. If the `sync_dir` argument is true, ensure the
@@ -159,10 +171,11 @@ mod vfs {
         };
         println!("delete z_name={:?}", name);
 
-        let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().unwrap();
-        let mut state: std::ptr::NonNull<State<V>> =
-            NonNull::new(vfs.pAppData as _).expect("pAppData is null");
-        let state = state.as_mut();
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
 
         let slice = CStr::from_ptr(z_path);
         let osstr = OsStr::from_bytes(slice.to_bytes());
@@ -173,6 +186,7 @@ mod vfs {
                 if err.kind() == ErrorKind::NotFound {
                     ffi::SQLITE_OK
                 } else {
+                    state.last_error.set(Some(err));
                     ffi::SQLITE_DELETE
                 }
             }
@@ -194,39 +208,49 @@ mod vfs {
         };
         println!("access z_name={:?} flags={}", name, flags);
 
-        let vfs: &mut ffi::sqlite3_vfs = p_vfs.as_mut().unwrap();
-        let mut state: std::ptr::NonNull<State<V>> =
-            NonNull::new(vfs.pAppData as _).expect("pAppData is null");
-        let state = state.as_mut();
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
 
         let slice = CStr::from_ptr(z_path);
         let osstr = OsStr::from_bytes(slice.to_bytes());
 
-        match state.vfs.access(osstr.as_ref()) {
-            Ok(ok) => {
-                let p_res_out: &mut c_int = p_res_out.as_mut().unwrap();
-                *p_res_out = ok as i32;
-
-                ffi::SQLITE_OK
-            }
-            Err(_err) => ffi::SQLITE_IOERR_ACCESS,
+        if let Err(err) = state.vfs.access(osstr.as_ref()).and_then(|ok| {
+            let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
+            *p_res_out = ok as i32;
+            Ok(())
+        }) {
+            state.last_error.set(Some(err));
+            return ffi::SQLITE_IOERR_ACCESS;
         }
+
+        ffi::SQLITE_OK
     }
 
     /// Populate buffer `z_out` with the full canonical pathname corresponding to the pathname in
     /// `z_path`. `z_out` is guaranteed to point to a buffer of at least (INST_MAX_PATHNAME+1)
     /// bytes.
     pub unsafe extern "C" fn full_pathname(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+        p_vfs: *mut ffi::sqlite3_vfs,
         z_path: *const c_char,
         n_out: c_int,
         z_out: *mut c_char,
     ) -> c_int {
         let name = CStr::from_ptr(z_path);
         println!("full_pathname name={}", name.to_string_lossy());
+
+        let state = match vfs_state::<()>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
+
         let name = name.to_bytes_with_nul();
-        assert!(name.len() <= n_out as usize); // TODO: proper error
-        assert!(name.len() <= MAX_PATH_LENGTH); // TODO: proper error
+        if name.len() > n_out as usize || name.len() > MAX_PATH_LENGTH {
+            return ffi::SQLITE_ERROR;
+        }
         let out = slice::from_raw_parts_mut(z_out as *mut u8, name.len());
         out.copy_from_slice(name);
 
@@ -252,8 +276,8 @@ mod vfs {
     ) {
         println!("dlerror");
 
-        let msg = CString::new("Loadable extensions are not supported").unwrap();
-        ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr());
+        let msg = concat!("Loadable extensions are not supported", "\0");
+        ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr() as _);
     }
 
     /// Return a pointer to the symbol `z_sym` in the dynamic library pHandle.
@@ -298,10 +322,16 @@ mod vfs {
 
     /// Return the current time as a Julian Day number in `p_time_out`.
     pub unsafe extern "C" fn current_time(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+        p_vfs: *mut ffi::sqlite3_vfs,
         p_time_out: *mut f64,
     ) -> c_int {
         println!("current_time");
+
+        let state = match vfs_state::<()>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
         *p_time_out = 2440587.5 + now / 864.0e5;
@@ -309,15 +339,38 @@ mod vfs {
     }
 
     pub unsafe extern "C" fn get_last_error(
-        _arg1: *mut ffi::sqlite3_vfs,
-        _n_byte: c_int,
-        _z_err_msg: *mut c_char,
+        p_vfs: *mut ffi::sqlite3_vfs,
+        n_byte: c_int,
+        z_err_msg: *mut c_char,
     ) -> c_int {
-        todo!("get_last_error")
+        let state = match vfs_state::<()>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+        if let Some(err) = state.last_error.take() {
+            let msg = match CString::new(err.to_string()) {
+                Ok(msg) => msg,
+                Err(_) => return ffi::SQLITE_ERROR,
+            };
+
+            let msg = msg.to_bytes_with_nul();
+            if msg.len() > n_byte as usize {
+                return ffi::SQLITE_ERROR;
+            }
+            let out = slice::from_raw_parts_mut(z_err_msg as *mut u8, msg.len());
+            out.copy_from_slice(msg);
+        }
+        ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn current_time_int64(_p_vfs: *mut ffi::sqlite3_vfs, p: *mut i64) -> i32 {
+    pub unsafe extern "C" fn current_time_int64(p_vfs: *mut ffi::sqlite3_vfs, p: *mut i64) -> i32 {
         println!("current_time_int64");
+
+        let state = match vfs_state::<()>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_CANTOPEN,
+        };
+        state.last_error.take();
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
         *p = ((2440587.5 + now / 864.0e5) * 864.0e5) as i64;
@@ -326,18 +379,25 @@ mod vfs {
 }
 
 mod io {
+    use std::ptr::null;
+
     use super::*;
 
     /// Close a file.
     pub unsafe extern "C" fn close<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("close");
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
+        let f = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_CLOSE,
+        };
 
         // TODO: only when free on close is set?
         Box::from_raw(f.file);
         f.file = null_mut();
+
+        Rc::from_raw(f.last_error);
+        f.last_error = null();
 
         ffi::SQLITE_OK
     }
@@ -351,24 +411,34 @@ mod io {
     ) -> c_int {
         println!("read offset={} len={}", i_ofst, i_amt);
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
-        let f: &mut F = f.file.as_mut().unwrap();
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_CLOSE,
+        };
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_CLOSE,
+        };
 
-        match f.seek(SeekFrom::Start(i_ofst as u64)) {
+        match file.seek(SeekFrom::Start(i_ofst as u64)) {
             Ok(o) => {
                 if o != i_ofst as u64 {
                     return ffi::SQLITE_IOERR_READ;
                 }
             }
-            Err(_) => return ffi::SQLITE_IOERR_READ,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_READ;
+            }
         }
 
         let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-        if let Err(err) = f.read_exact(out) {
-            if err.kind() == ErrorKind::UnexpectedEof {
+        if let Err(err) = file.read_exact(out) {
+            let kind = err.kind();
+            if kind == ErrorKind::UnexpectedEof {
                 return ffi::SQLITE_IOERR_SHORT_READ;
             } else {
+                state.set_last_error(err);
                 return ffi::SQLITE_IOERR_READ;
             }
         }
@@ -385,21 +455,33 @@ mod io {
     ) -> c_int {
         println!("write offset={} len={}", i_ofst, i_amt);
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
-        let f: &mut F = f.file.as_mut().unwrap();
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_WRITE,
+        };
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_WRITE;
+            }
+        };
 
-        match f.seek(SeekFrom::Start(i_ofst as u64)) {
+        match file.seek(SeekFrom::Start(i_ofst as u64)) {
             Ok(o) => {
                 if o != i_ofst as u64 {
                     return ffi::SQLITE_IOERR_WRITE;
                 }
             }
-            Err(_) => return ffi::SQLITE_IOERR_WRITE,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_WRITE;
+            }
         }
 
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
-        if f.write_all(data).is_err() {
+        if let Err(err) = file.write_all(data) {
+            state.set_last_error(err);
             return ffi::SQLITE_IOERR_WRITE;
         }
 
@@ -419,11 +501,20 @@ mod io {
     pub unsafe extern "C" fn sync<F: File>(p_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
         println!("sync");
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
-        let f: &mut F = f.file.as_mut().unwrap();
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_FSYNC,
+        };
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_FSYNC;
+            }
+        };
 
-        if f.flush().is_err() {
+        if let Err(err) = file.flush() {
+            state.set_last_error(err);
             return ffi::SQLITE_IOERR_FSYNC;
         }
 
@@ -437,43 +528,77 @@ mod io {
     ) -> c_int {
         println!("file_size");
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
-        let f: &mut F = f.file.as_mut().unwrap();
-
-        let file_size = match f.file_size() {
-            Ok(n) => n,
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().unwrap();
-        *p_size = file_size as ffi::sqlite3_int64;
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_FSTAT;
+            }
+        };
+
+        if let Err(err) = file.file_size().and_then(|n| {
+            let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().ok_or_else(null_ptr_error)?;
+            *p_size = n as ffi::sqlite3_int64;
+            Ok(())
+        }) {
+            state.set_last_error(err);
+            return ffi::SQLITE_IOERR_FSTAT;
+        }
 
         ffi::SQLITE_OK
     }
 
     /// Lock a file.
-    pub unsafe extern "C" fn lock(_p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
+    pub unsafe extern "C" fn lock(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
         println!("lock");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_IOERR_LOCK;
+        }
+
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
     /// Unlock a file.
-    pub unsafe extern "C" fn unlock(_p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
+    pub unsafe extern "C" fn unlock(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
         println!("unlock");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_IOERR_UNLOCK;
+        }
+
         // TODO: implement locking
         ffi::SQLITE_OK
     }
 
     /// Check if another file-handle holds a RESERVED lock on a file.
     pub unsafe extern "C" fn check_reserved_lock(
-        _p_file: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
         println!("check_reserved_lock");
 
-        let p_res_out: &mut c_int = p_res_out.as_mut().unwrap();
-        *p_res_out = false as i32;
+        let state = match file_state::<()>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
+        };
+
+        match p_res_out.as_mut() {
+            Some(p_res_out) => {
+                *p_res_out = false as i32;
+            }
+            None => {
+                state.set_last_error(null_ptr_error());
+                return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK;
+            }
+        }
 
         // TODO: implement locking
         ffi::SQLITE_OK
@@ -481,24 +606,40 @@ mod io {
 
     /// File control method. For custom operations on an mem-file.
     pub unsafe extern "C" fn file_control(
-        _p_file: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         op: c_int,
         _p_arg: *mut c_void,
     ) -> c_int {
         println!("file_control op={}", op);
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_ERROR;
+        }
+
         ffi::SQLITE_NOTFOUND
     }
 
     /// Return the sector-size in bytes for a file.
-    pub unsafe extern "C" fn sector_size(_p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn sector_size(p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("sector_size");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_ERROR;
+        }
 
         1
     }
 
     /// Return the device characteristic flags supported by a file.
-    pub unsafe extern "C" fn device_characteristics(_p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn device_characteristics(p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("device_characteristics");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_ERROR;
+        }
 
         // For now, simply copied from [memfs] without putting in a lot of thought.
         // [memfs]: (https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c#L271-L276)
@@ -518,35 +659,53 @@ mod io {
 
     /// Create a shared memory file mapping.
     pub unsafe extern "C" fn shm_map(
-        _p_file: *mut ffi::sqlite3_file,
-        _i_pg: i32,
-        _pgsz: i32,
-        _b_extend: i32,
+        p_file: *mut ffi::sqlite3_file,
+        i_pg: i32,
+        pgsz: i32,
+        b_extend: i32,
         _pp: *mut *mut c_void,
     ) -> i32 {
-        println!("shm_map");
+        println!("shm_map pg={} sz={} extend={}", i_pg, pgsz, b_extend);
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_IOERR_SHMMAP;
+        }
+
         ffi::SQLITE_IOERR_SHMMAP
     }
 
     /// Perform locking on a shared-memory segment.
     pub unsafe extern "C" fn shm_lock(
-        _p_file: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         _offset: i32,
         _n: i32,
         _flags: i32,
     ) -> i32 {
         println!("shm_lock");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_IOERR_SHMMAP;
+        }
+
         ffi::SQLITE_IOERR_SHMLOCK
     }
 
     /// Memory barrier operation on shared memory.
     pub unsafe extern "C" fn shm_barrier(_p_file: *mut ffi::sqlite3_file) {
-        println!("shm_barrier")
+        println!("shm_barrier");
     }
 
     /// Unmap a shared memory segment.
-    pub unsafe extern "C" fn shm_unmap(_p_file: *mut ffi::sqlite3_file, _delete_flags: i32) -> i32 {
+    pub unsafe extern "C" fn shm_unmap(p_file: *mut ffi::sqlite3_file, _delete_flags: i32) -> i32 {
         println!("shm_unmap");
+
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_IOERR_SHMMAP;
+        }
+
         ffi::SQLITE_OK
     }
 
@@ -559,13 +718,22 @@ mod io {
     ) -> i32 {
         println!("mem_fetch offset={} len={}", i_ofst, i_amt);
 
-        let mut f = NonNull::new(p_file as _).unwrap();
-        let f: &mut FileState<F> = f.as_mut();
-        let f: &mut F = f.file.as_mut().unwrap();
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
 
-        if let Some(slice) = f.fetch(i_ofst as usize, i_amt as usize) {
-            let pp: &mut *mut c_void = pp.as_mut().unwrap();
+        if let Some(Err(err)) = file.fetch(i_ofst as usize, i_amt as usize).map(|slice| {
+            let pp: &mut *mut c_void = pp.as_mut().ok_or_else(null_ptr_error)?;
             *pp = slice.as_mut_ptr() as _;
+            Ok(())
+        }) {
+            state.set_last_error(err);
+            return ffi::SQLITE_ERROR;
         }
 
         ffi::SQLITE_OK
@@ -573,24 +741,103 @@ mod io {
 
     /// Release a memory-mapped page.
     pub unsafe extern "C" fn mem_unfetch(
-        _p_file: *mut ffi::sqlite3_file,
+        p_file: *mut ffi::sqlite3_file,
         i_ofst: i64,
         _p_page: *mut c_void,
     ) -> i32 {
         println!("mem_unfetch offset={}", i_ofst);
 
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
+            return ffi::SQLITE_ERROR;
+        }
+
         ffi::SQLITE_OK
     }
 }
 
+impl<F> FileState<F> {
+    unsafe fn unset_last_error(&mut self) {
+        let last_error = Rc::from_raw(self.last_error);
+        last_error.take();
+        self.last_error = Rc::into_raw(last_error);
+    }
+
+    unsafe fn set_last_error(&mut self, err: std::io::Error) {
+        let last_error = Rc::from_raw(self.last_error);
+        println!("ERRRRRRRRRRRRRRRRRR {:?}", err);
+        last_error.set(Some(err));
+        self.last_error = Rc::into_raw(last_error);
+    }
+}
+
+fn null_ptr_error() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Other, "received null pointer")
+}
+
+unsafe fn vfs_state<'a, V>(ptr: *mut ffi::sqlite3_vfs) -> Result<&'a mut State<V>, std::io::Error> {
+    let vfs: &mut ffi::sqlite3_vfs = ptr.as_mut().ok_or_else(null_ptr_error)?;
+    let state = (vfs.pAppData as *mut State<V>)
+        .as_mut()
+        .ok_or_else(null_ptr_error)?;
+    Ok(state)
+}
+
+unsafe fn file_state<'a, F>(
+    ptr: *mut ffi::sqlite3_file,
+    reset_last_error: bool,
+) -> Result<&'a mut FileState<F>, std::io::Error> {
+    let f = (ptr as *mut FileState<F>)
+        .as_mut()
+        .ok_or_else(null_ptr_error)?;
+    if reset_last_error {
+        f.unset_last_error();
+    }
+    Ok(f)
+}
+
+unsafe fn file<'a, F>(ptr: *mut F) -> Result<&'a mut F, std::io::Error> {
+    let f: &mut F = ptr.as_mut().ok_or_else(null_ptr_error)?;
+    Ok(f)
+}
+
 impl<F> Drop for FileState<F> {
     fn drop(&mut self) {
-        unsafe { Box::from_raw(self.file) };
+        unsafe {
+            Box::from_raw(self.file);
+            Rc::from_raw(self.last_error);
+        };
     }
 }
 
 impl File for std::fs::File {
     fn file_size(&self) -> Result<u64, std::io::Error> {
         Ok(self.metadata()?.len())
+    }
+}
+
+#[derive(Debug)]
+pub enum RegisterError {
+    Nul(std::ffi::NulError),
+    Register(i32),
+}
+
+impl std::error::Error for RegisterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Nul(err) => Some(err),
+            Self::Register(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nul(_) => f.write_str("interior nul byte in name found"),
+            Self::Register(code) => {
+                write!(f, "registering sqlite vfs failed with error code: {}", code)
+            }
+        }
     }
 }
