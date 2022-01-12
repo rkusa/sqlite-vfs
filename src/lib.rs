@@ -13,6 +13,10 @@ use rusqlite::ffi;
 
 pub trait File: Read + Seek + Write {
     fn file_size(&self) -> Result<u64, std::io::Error>;
+
+    fn fetch(&self, _offset: usize, _len: usize) -> Option<&mut [u8]> {
+        None
+    }
 }
 
 pub trait Vfs {
@@ -34,7 +38,7 @@ struct State<V> {
 pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
     let name = ManuallyDrop::new(CString::new(name).unwrap());
     let io_methods = ffi::sqlite3_io_methods {
-        iVersion: 1,
+        iVersion: 3,
         xClose: Some(io::close::<F>),
         xRead: Some(io::read::<F>),
         xWrite: Some(io::write::<F>),
@@ -47,18 +51,16 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
         xFileControl: Some(io::file_control),
         xSectorSize: Some(io::sector_size),
         xDeviceCharacteristics: Some(io::device_characteristics),
-        // TODO: implement v2?
-        xShmMap: None,
-        xShmLock: None,
-        xShmBarrier: None,
-        xShmUnmap: None,
-        // TODO: implement v3?
-        xFetch: None,
-        xUnfetch: None,
+        xShmMap: Some(io::shm_map),
+        xShmLock: Some(io::shm_lock),
+        xShmBarrier: Some(io::shm_barrier),
+        xShmUnmap: Some(io::shm_unmap),
+        xFetch: Some(io::mem_fetch::<F>),
+        xUnfetch: Some(io::mem_unfetch),
     };
     let ptr = Box::into_raw(Box::new(State { vfs, io_methods }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
-        iVersion: 1,
+        iVersion: 3,
         szOsFile: size_of::<FileState<F>>() as i32,
         mxPathname: MAX_PATH_LENGTH as i32, // max path length supported by VFS
         pNext: null_mut(),
@@ -76,13 +78,14 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) {
         xSleep: Some(vfs::sleep),
         xCurrentTime: Some(vfs::current_time),
         xGetLastError: Some(vfs::get_last_error),
-        xCurrentTimeInt64: None,
+        xCurrentTimeInt64: Some(vfs::current_time_int64),
         xSetSystemCall: None,
         xGetSystemCall: None,
         xNextSystemCall: None,
     }));
 
     if unsafe { ffi::sqlite3_vfs_register(vfs, false as i32) } != ffi::SQLITE_OK {
+        // TODO: proper error
         panic!("not ok!");
     }
 
@@ -312,6 +315,14 @@ mod vfs {
     ) -> c_int {
         todo!("get_last_error")
     }
+
+    pub unsafe extern "C" fn current_time_int64(_p_vfs: *mut ffi::sqlite3_vfs, p: *mut i64) -> i32 {
+        println!("current_time_int64");
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+        *p = ((2440587.5 + now / 864.0e5) * 864.0e5) as i64;
+        ffi::SQLITE_OK
+    }
 }
 
 mod io {
@@ -503,6 +514,72 @@ mod io {
         ffi::SQLITE_IOCAP_SAFE_APPEND |
         // information is written to disk in the same order as calls to xWrite()
         ffi::SQLITE_IOCAP_SEQUENTIAL
+    }
+
+    /// Create a shared memory file mapping.
+    pub unsafe extern "C" fn shm_map(
+        _p_file: *mut ffi::sqlite3_file,
+        _i_pg: i32,
+        _pgsz: i32,
+        _b_extend: i32,
+        _pp: *mut *mut c_void,
+    ) -> i32 {
+        println!("shm_map");
+        ffi::SQLITE_IOERR_SHMMAP
+    }
+
+    /// Perform locking on a shared-memory segment.
+    pub unsafe extern "C" fn shm_lock(
+        _p_file: *mut ffi::sqlite3_file,
+        _offset: i32,
+        _n: i32,
+        _flags: i32,
+    ) -> i32 {
+        println!("shm_lock");
+        ffi::SQLITE_IOERR_SHMLOCK
+    }
+
+    /// Memory barrier operation on shared memory.
+    pub unsafe extern "C" fn shm_barrier(_p_file: *mut ffi::sqlite3_file) {
+        println!("shm_barrier")
+    }
+
+    /// Unmap a shared memory segment.
+    pub unsafe extern "C" fn shm_unmap(_p_file: *mut ffi::sqlite3_file, _delete_flags: i32) -> i32 {
+        println!("shm_unmap");
+        ffi::SQLITE_OK
+    }
+
+    /// Fetch a page of a memory-mapped file.
+    pub unsafe extern "C" fn mem_fetch<F: File>(
+        p_file: *mut ffi::sqlite3_file,
+        i_ofst: i64,
+        i_amt: i32,
+        pp: *mut *mut c_void,
+    ) -> i32 {
+        println!("mem_fetch offset={} len={}", i_ofst, i_amt);
+
+        let mut f = NonNull::new(p_file as _).unwrap();
+        let f: &mut FileState<F> = f.as_mut();
+        let f: &mut F = f.file.as_mut().unwrap();
+
+        if let Some(slice) = f.fetch(i_ofst as usize, i_amt as usize) {
+            let pp: &mut *mut c_void = pp.as_mut().unwrap();
+            *pp = slice.as_mut_ptr() as _;
+        }
+
+        ffi::SQLITE_OK
+    }
+
+    /// Release a memory-mapped page.
+    pub unsafe extern "C" fn mem_unfetch(
+        _p_file: *mut ffi::sqlite3_file,
+        i_ofst: i64,
+        _p_page: *mut c_void,
+    ) -> i32 {
+        println!("mem_unfetch offset={}", i_ofst);
+
+        ffi::SQLITE_OK
     }
 }
 
