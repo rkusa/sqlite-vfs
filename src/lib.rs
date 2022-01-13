@@ -1,11 +1,11 @@
 use core::slice;
 use std::cell::Cell;
-use std::ffi::{c_void, CStr, CString, OsStr};
+use std::ffi::{c_void, CStr, CString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop};
 use std::os::raw::{c_char, c_int};
-use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
+use std::ptr::null;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::thread;
@@ -13,22 +13,20 @@ use std::time::Duration;
 use std::time::Instant;
 
 use rusqlite::ffi;
+pub use rusqlite::OpenFlags;
 
 pub trait File: Read + Seek + Write {
     fn file_size(&self) -> Result<u64, std::io::Error>;
-
-    fn fetch(&self, _offset: usize, _len: usize) -> Option<&mut [u8]> {
-        None
-    }
 }
 
 pub trait Vfs {
     type File: File;
 
-    fn open(&self, path: &Path) -> Result<Self::File, std::io::Error>;
+    fn open(&self, path: &Path, flags: OpenFlags) -> Result<Self::File, std::io::Error>;
     fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
+    fn exists(&self, _path: &Path) -> Result<bool, std::io::Error>;
 
-    fn access(&self, _path: &Path) -> Result<bool, std::io::Error> {
+    fn access(&self, _path: &Path, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
     }
 }
@@ -92,9 +90,10 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), std
         xNextSystemCall: None,
     }));
 
-    if unsafe { ffi::sqlite3_vfs_register(vfs, false as i32) } != ffi::SQLITE_OK {
+    let result = unsafe { ffi::sqlite3_vfs_register(vfs, false as i32) };
+    if result != ffi::SQLITE_OK {
         // TODO: proper error
-        panic!("not ok!");
+        panic!("not ok! {}", result);
     }
 
     // TODO: return object that allows to unregister (and cleanup the memory)
@@ -107,6 +106,7 @@ const MAX_PATH_LENGTH: usize = 512;
 #[repr(C)]
 struct FileState<F> {
     base: ffi::sqlite3_file,
+    name: *mut i8,
     file: *mut F,
     last_error: *const Cell<Option<std::io::Error>>,
 }
@@ -134,22 +134,30 @@ mod vfs {
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_ERROR,
         };
         state.last_error.take();
 
-        let slice = CStr::from_ptr(z_name);
-        let osstr = OsStr::from_bytes(slice.to_bytes());
+        let path = CStr::from_ptr(z_name);
+        // TODO: any way to use OsStr instead?
+        let path = path.to_string_lossy().to_string();
 
-        if let Err(err) = state.vfs.open(osstr.as_ref()).and_then(|f| {
-            let out_file = (p_file as *mut FileState<F>)
-                .as_mut()
-                .ok_or_else(null_ptr_error)?;
-            out_file.base.pMethods = &state.io_methods;
-            out_file.file = Box::into_raw(Box::new(f));
-            out_file.last_error = Rc::into_raw(Rc::clone(&state.last_error));
-            Ok(())
-        }) {
+        if let Err(err) = state
+            .vfs
+            .open(path.as_ref(), OpenFlags::from_bits_unchecked(flags))
+            .and_then(|f| {
+                let out_file = (p_file as *mut FileState<F>)
+                    .as_mut()
+                    .ok_or_else(null_ptr_error)?;
+                out_file.base.pMethods = &state.io_methods;
+                // TODO: unwrap
+                out_file.name = CString::new(name.unwrap().to_string()).unwrap().into_raw();
+                out_file.file = Box::into_raw(Box::new(f));
+                out_file.last_error = Rc::into_raw(Rc::clone(&state.last_error));
+                Ok(())
+            })
+        {
+            eprintln!("OPEN ERR: {}", err);
             state.last_error.set(Some(err));
             return ffi::SQLITE_CANTOPEN;
         }
@@ -173,14 +181,15 @@ mod vfs {
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_DELETE,
         };
         state.last_error.take();
 
-        let slice = CStr::from_ptr(z_path);
-        let osstr = OsStr::from_bytes(slice.to_bytes());
+        let path = CStr::from_ptr(z_path);
+        // TODO: any way to use OsStr instead?
+        let path = path.to_string_lossy().to_string();
 
-        match state.vfs.delete(osstr.as_ref()) {
+        match state.vfs.delete(path.as_ref()) {
             Ok(_) => ffi::SQLITE_OK,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
@@ -210,14 +219,22 @@ mod vfs {
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_ERROR,
         };
         state.last_error.take();
 
-        let slice = CStr::from_ptr(z_path);
-        let osstr = OsStr::from_bytes(slice.to_bytes());
+        let path = CStr::from_ptr(z_path);
+        // TODO: any way to use OsStr instead?
+        let path = path.to_string_lossy().to_string();
 
-        if let Err(err) = state.vfs.access(osstr.as_ref()).and_then(|ok| {
+        let result = match flags {
+            ffi::SQLITE_ACCESS_EXISTS => state.vfs.exists(path.as_ref()),
+            ffi::SQLITE_ACCESS_READ => state.vfs.access(path.as_ref(), false),
+            ffi::SQLITE_ACCESS_READWRITE => state.vfs.access(path.as_ref(), true),
+            _ => return ffi::SQLITE_IOERR_ACCESS,
+        };
+
+        if let Err(err) = result.and_then(|ok| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
             *p_res_out = ok as i32;
             Ok(())
@@ -243,7 +260,7 @@ mod vfs {
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_ERROR,
         };
         state.last_error.take();
 
@@ -329,7 +346,7 @@ mod vfs {
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_ERROR,
         };
         state.last_error.take();
 
@@ -368,7 +385,7 @@ mod vfs {
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
-            Err(_) => return ffi::SQLITE_CANTOPEN,
+            Err(_) => return ffi::SQLITE_ERROR,
         };
         state.last_error.take();
 
@@ -379,25 +396,27 @@ mod vfs {
 }
 
 mod io {
-    use std::ptr::null;
-
     use super::*;
 
     /// Close a file.
     pub unsafe extern "C" fn close<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
         println!("close");
 
-        let f = match file_state::<F>(p_file, true) {
+        let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
+        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
 
         // TODO: only when free on close is set?
-        Box::from_raw(f.file);
-        f.file = null_mut();
+        drop(CString::from_raw(state.name));
+        state.name = null_mut();
 
-        Rc::from_raw(f.last_error);
-        f.last_error = null();
+        Box::from_raw(state.file);
+        state.file = null_mut();
+
+        Rc::from_raw(state.last_error);
+        state.last_error = null();
 
         ffi::SQLITE_OK
     }
@@ -415,6 +434,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
+        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
@@ -459,6 +479,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
+        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -505,6 +526,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
+        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -532,6 +554,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
+        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -629,7 +652,7 @@ mod io {
             return ffi::SQLITE_ERROR;
         }
 
-        1
+        1024
     }
 
     /// Return the device characteristic flags supported by a file.
@@ -714,29 +737,16 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         i_ofst: i64,
         i_amt: i32,
-        pp: *mut *mut c_void,
+        _pp: *mut *mut c_void,
     ) -> i32 {
         println!("mem_fetch offset={} len={}", i_ofst, i_amt);
 
-        let state = match file_state::<F>(p_file, true) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_ERROR,
-        };
-        let file = match file::<F>(state.file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_ERROR,
-        };
-
-        if let Some(Err(err)) = file.fetch(i_ofst as usize, i_amt as usize).map(|slice| {
-            let pp: &mut *mut c_void = pp.as_mut().ok_or_else(null_ptr_error)?;
-            *pp = slice.as_mut_ptr() as _;
-            Ok(())
-        }) {
-            state.set_last_error(err);
+        // reset last error
+        if file_state::<()>(p_file, true).is_err() {
             return ffi::SQLITE_ERROR;
         }
 
-        ffi::SQLITE_OK
+        ffi::SQLITE_ERROR
     }
 
     /// Release a memory-mapped page.
@@ -765,7 +775,6 @@ impl<F> FileState<F> {
 
     unsafe fn set_last_error(&mut self, err: std::io::Error) {
         let last_error = Rc::from_raw(self.last_error);
-        println!("ERRRRRRRRRRRRRRRRRR {:?}", err);
         last_error.set(Some(err));
         self.last_error = Rc::into_raw(last_error);
     }
@@ -804,6 +813,7 @@ unsafe fn file<'a, F>(ptr: *mut F) -> Result<&'a mut F, std::io::Error> {
 impl<F> Drop for FileState<F> {
     fn drop(&mut self) {
         unsafe {
+            drop(CString::from_raw(self.name));
             Box::from_raw(self.file);
             Rc::from_raw(self.last_error);
         };
@@ -812,7 +822,7 @@ impl<F> Drop for FileState<F> {
 
 impl File for std::fs::File {
     fn file_size(&self) -> Result<u64, std::io::Error> {
-        Ok(self.metadata()?.len())
+        Ok(dbg!(self.metadata()?.len()))
     }
 }
 
