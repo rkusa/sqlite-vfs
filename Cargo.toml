@@ -5,6 +5,9 @@ authors = ["Markus Ast <m@rkusa.st>"]
 edition = "2021"
 
 [dependencies]
-rusqlite = { version = "0.26", features = ["bundled", "wasm32-wasi-vfs"] }
+rusqlite = { version = "0.26", features = ["bundled"] }
 rand = "0.8"
 time = { version = "0.3" }
+
+[patch.crates-io]
+rusqlite = { git = "https://github.com/rkusa/rusqlite.git", branch = "wasi" }
