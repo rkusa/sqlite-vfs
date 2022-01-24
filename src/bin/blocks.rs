@@ -36,7 +36,7 @@ impl<const BLOCK_SIZE: u32> Vfs for BlockVfs<BLOCK_SIZE> {
     }
 
     fn delete(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-        println!("Ignore delete {}", path.to_string_lossy());
+        log::trace!("Ignore delete {}", path.to_string_lossy());
         // std::fs::remove_file(path)
         Ok(())
     }
@@ -77,7 +77,7 @@ impl<const BLOCK_SIZE: u32> Seek for Blocks<BLOCK_SIZE> {
             SeekFrom::Current(_) => unimplemented!(),
         };
 
-        println!("seek to {}", offset);
+        log::trace!("seek to {}", offset);
 
         self.offset = offset;
         let block = self.current()?;
@@ -137,7 +137,7 @@ impl<const BLOCK_SIZE: u32> Blocks<BLOCK_SIZE> {
             entry.insert(Block { file, dirty: false });
         }
 
-        println!("Block: {}", index);
+        log::trace!("Block: {}", index);
 
         Ok(self.blocks.get_mut(&index).unwrap())
     }

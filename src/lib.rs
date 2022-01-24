@@ -130,7 +130,7 @@ mod vfs {
         } else {
             CStr::from_ptr(z_name).to_str().ok()
         };
-        println!("open z_name={:?} flags={}", name, flags);
+        log::trace!("open z_name={:?} flags={}", name, flags);
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
@@ -157,7 +157,6 @@ mod vfs {
                 Ok(())
             })
         {
-            eprintln!("OPEN ERR: {}", err);
             state.last_error.set(Some(err));
             return ffi::SQLITE_CANTOPEN;
         }
@@ -177,7 +176,7 @@ mod vfs {
         } else {
             CStr::from_ptr(z_path).to_str().ok()
         };
-        println!("delete z_name={:?}", name);
+        log::trace!("delete z_name={:?}", name);
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
@@ -215,7 +214,7 @@ mod vfs {
         } else {
             CStr::from_ptr(z_path).to_str().ok()
         };
-        println!("access z_name={:?} flags={}", name, flags);
+        log::trace!("access z_name={:?} flags={}", name, flags);
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
@@ -256,7 +255,7 @@ mod vfs {
         z_out: *mut c_char,
     ) -> c_int {
         let name = CStr::from_ptr(z_path);
-        println!("full_pathname name={}", name.to_string_lossy());
+        log::trace!("full_pathname name={}", name.to_string_lossy());
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
@@ -279,7 +278,7 @@ mod vfs {
         _p_vfs: *mut ffi::sqlite3_vfs,
         _z_path: *const c_char,
     ) -> *mut c_void {
-        println!("dlopen");
+        log::trace!("dlopen");
 
         null_mut()
     }
@@ -291,7 +290,7 @@ mod vfs {
         n_byte: c_int,
         z_err_msg: *mut c_char,
     ) {
-        println!("dlerror");
+        log::trace!("dlerror");
 
         let msg = concat!("Loadable extensions are not supported", "\0");
         ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr() as _);
@@ -303,14 +302,14 @@ mod vfs {
         _p: *mut c_void,
         _z_sym: *const c_char,
     ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const i8)> {
-        println!("dlsym");
+        log::trace!("dlsym");
 
         None
     }
 
     /// Close the dynamic library handle `p_handle`.
     pub unsafe extern "C" fn dlclose(_p_vfs: *mut ffi::sqlite3_vfs, _p_handle: *mut c_void) {
-        println!("dlclose");
+        log::trace!("dlclose");
     }
 
     /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
@@ -319,7 +318,7 @@ mod vfs {
         n_byte: c_int,
         z_buf_out: *mut c_char,
     ) -> c_int {
-        println!("randomness");
+        log::trace!("randomness");
 
         use rand::Rng;
 
@@ -330,7 +329,7 @@ mod vfs {
 
     /// Sleep for `n_micro` microseconds. Return the number of microseconds actually slept.
     pub unsafe extern "C" fn sleep(_p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
-        println!("sleep");
+        log::trace!("sleep");
 
         let instant = Instant::now();
         thread::sleep(Duration::from_micros(n_micro as u64));
@@ -342,7 +341,7 @@ mod vfs {
         p_vfs: *mut ffi::sqlite3_vfs,
         p_time_out: *mut f64,
     ) -> c_int {
-        println!("current_time");
+        log::trace!("current_time");
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
@@ -381,7 +380,7 @@ mod vfs {
     }
 
     pub unsafe extern "C" fn current_time_int64(p_vfs: *mut ffi::sqlite3_vfs, p: *mut i64) -> i32 {
-        println!("current_time_int64");
+        log::trace!("current_time_int64");
 
         let state = match vfs_state::<()>(p_vfs) {
             Ok(state) => state,
@@ -400,13 +399,13 @@ mod io {
 
     /// Close a file.
     pub unsafe extern "C" fn close<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
-        println!("close");
+        log::trace!("close");
 
         let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
 
         // TODO: only when free on close is set?
         drop(CString::from_raw(state.name));
@@ -428,13 +427,13 @@ mod io {
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
-        println!("read offset={} len={}", i_ofst, i_amt);
+        log::trace!("read offset={} len={}", i_ofst, i_amt);
 
         let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
@@ -473,13 +472,13 @@ mod io {
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
-        println!("write offset={} len={}", i_ofst, i_amt);
+        log::trace!("write offset={} len={}", i_ofst, i_amt);
 
         let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
-        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -514,19 +513,19 @@ mod io {
         _p_file: *mut ffi::sqlite3_file,
         _size: ffi::sqlite3_int64,
     ) -> c_int {
-        println!("truncate");
+        log::trace!("truncate");
         todo!("truncate");
     }
 
     /// Persist changes to a file.
     pub unsafe extern "C" fn sync<F: File>(p_file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
-        println!("sync");
+        log::trace!("sync");
 
         let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -548,13 +547,13 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         p_size: *mut ffi::sqlite3_int64,
     ) -> c_int {
-        println!("file_size");
+        log::trace!("file_size");
 
         let state = match file_state::<F>(p_file, true) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        println!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -577,7 +576,7 @@ mod io {
 
     /// Lock a file.
     pub unsafe extern "C" fn lock(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
-        println!("lock");
+        log::trace!("lock");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -590,7 +589,7 @@ mod io {
 
     /// Unlock a file.
     pub unsafe extern "C" fn unlock(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
-        println!("unlock");
+        log::trace!("unlock");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -606,7 +605,7 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
-        println!("check_reserved_lock");
+        log::trace!("check_reserved_lock");
 
         let state = match file_state::<()>(p_file, true) {
             Ok(f) => f,
@@ -633,7 +632,7 @@ mod io {
         op: c_int,
         _p_arg: *mut c_void,
     ) -> c_int {
-        println!("file_control op={}", op);
+        log::trace!("file_control op={}", op);
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -645,7 +644,7 @@ mod io {
 
     /// Return the sector-size in bytes for a file.
     pub unsafe extern "C" fn sector_size(p_file: *mut ffi::sqlite3_file) -> c_int {
-        println!("sector_size");
+        log::trace!("sector_size");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -657,7 +656,7 @@ mod io {
 
     /// Return the device characteristic flags supported by a file.
     pub unsafe extern "C" fn device_characteristics(p_file: *mut ffi::sqlite3_file) -> c_int {
-        println!("device_characteristics");
+        log::trace!("device_characteristics");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -688,7 +687,7 @@ mod io {
         b_extend: i32,
         _pp: *mut *mut c_void,
     ) -> i32 {
-        println!("shm_map pg={} sz={} extend={}", i_pg, pgsz, b_extend);
+        log::trace!("shm_map pg={} sz={} extend={}", i_pg, pgsz, b_extend);
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -705,7 +704,7 @@ mod io {
         _n: i32,
         _flags: i32,
     ) -> i32 {
-        println!("shm_lock");
+        log::trace!("shm_lock");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -717,12 +716,12 @@ mod io {
 
     /// Memory barrier operation on shared memory.
     pub unsafe extern "C" fn shm_barrier(_p_file: *mut ffi::sqlite3_file) {
-        println!("shm_barrier");
+        log::trace!("shm_barrier");
     }
 
     /// Unmap a shared memory segment.
     pub unsafe extern "C" fn shm_unmap(p_file: *mut ffi::sqlite3_file, _delete_flags: i32) -> i32 {
-        println!("shm_unmap");
+        log::trace!("shm_unmap");
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -739,7 +738,7 @@ mod io {
         i_amt: i32,
         _pp: *mut *mut c_void,
     ) -> i32 {
-        println!("mem_fetch offset={} len={}", i_ofst, i_amt);
+        log::trace!("mem_fetch offset={} len={}", i_ofst, i_amt);
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
@@ -755,7 +754,7 @@ mod io {
         i_ofst: i64,
         _p_page: *mut c_void,
     ) -> i32 {
-        println!("mem_unfetch offset={}", i_ofst);
+        log::trace!("mem_unfetch offset={}", i_ofst);
 
         // reset last error
         if file_state::<()>(p_file, true).is_err() {
