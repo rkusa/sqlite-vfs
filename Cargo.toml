@@ -6,6 +6,8 @@ license = "MIT OR Apache-2.0"
 edition = "2021"
 description = "Build SQLite virtual file systems (VFS) by implementing a simple Rust trait."
 repository = "https://github.com/rkusa/sqlite-vfs"
+documentation = "https://docs.rs/sqlite-vfs"
+keywords = ["sqlite", "vfs"]
 
 [dependencies]
 libsqlite3-sys = { version = "0.23", features = ["bundled"] }
