@@ -1,4 +1,7 @@
-use core::slice;
+#![allow(clippy::question_mark)]
+//! Create a custom SQLite virtual file system by implementing the [Vfs] trait and registering it
+//! using [register].
+
 use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -8,27 +11,117 @@ use std::path::Path;
 use std::ptr::null;
 use std::ptr::null_mut;
 use std::rc::Rc;
+use std::slice;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use rusqlite::ffi;
-pub use rusqlite::OpenFlags;
+use libsqlite3_sys as ffi;
 
+/// A file opened by [Vfs].
 pub trait File: Read + Seek + Write {
     fn file_size(&self) -> Result<u64, std::io::Error>;
+    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
 }
 
+/// A virtual file system for SQLite.
+///
+/// # Example
+/// This example uses [std::fs] to to persist the database to disk.
+/// ```
+/// # use std::fs;
+/// # use std::path::Path;
+/// #
+/// # use sqlite_vfs::{OpenAccess, OpenOptions, Vfs};
+/// #
+/// struct FsVfs;
+///
+/// impl Vfs for FsVfs {
+///     type File = fs::File;
+///
+///     fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
+///         let mut o = fs::OpenOptions::new();
+///         o.read(true).write(opts.access != OpenAccess::Read);
+///         match opts.access {
+///             OpenAccess::Create => {
+///                 o.create(true);
+///             }
+///             OpenAccess::CreateNew => {
+///                 o.create_new(true);
+///             }
+///             _ => {}
+///         }
+///         let f = o.open(path)?;
+///         Ok(f)
+///     }
+///
+///     fn delete(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+///         std::fs::remove_file(path)
+///     }
+///
+///     fn exists(&self, path: &Path) -> Result<bool, std::io::Error> {
+///         Ok(path.is_file())
+///     }
+/// }
+/// ```
 pub trait Vfs {
+    /// The file returned by [Vfs::open].
     type File: File;
 
-    fn open(&self, path: &Path, flags: OpenFlags) -> Result<Self::File, std::io::Error>;
-    fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
-    fn exists(&self, _path: &Path) -> Result<bool, std::io::Error>;
+    /// Open the database object (of type `opts.kind`) at `path`.
+    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error>;
 
+    /// Delete the database object at `path`.
+    fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
+
+    /// Check if and object at `path` already exists.
+    fn exists(&self, path: &Path) -> Result<bool, std::io::Error>;
+
+    /// Check access to `path`. The default implementation always returns `true`.
     fn access(&self, _path: &Path, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenOptions {
+    /// The object type that is being opened.
+    pub kind: OpenKind,
+
+    /// The access an object is opened with.
+    pub access: OpenAccess,
+
+    /// The file should be deleted when it is closed.
+    pub delete_on_close: bool,
+}
+
+/// The object type that is being opened.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenKind {
+    MainDb,
+    MainJournal,
+    TempDb,
+    TempJournal,
+    TransientDb,
+    SubJournal,
+    SuperJournal,
+    Wal,
+}
+
+/// The access an object is opened with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenAccess {
+    /// Read access.
+    Read,
+
+    /// Write access (includes read access).
+    Write,
+
+    /// Create the file if it does not exist (includes write and read access).
+    Create,
+
+    /// Create the file, but throw if it it already exist (includes write and read access).
+    CreateNew,
 }
 
 struct State<V> {
@@ -37,14 +130,15 @@ struct State<V> {
     last_error: Rc<Cell<Option<std::io::Error>>>,
 }
 
-pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), std::ffi::NulError> {
+/// Register a virtual file system ([Vfs]) to SQLite.
+pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), RegisterError> {
     let name = ManuallyDrop::new(CString::new(name)?);
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 3,
         xClose: Some(io::close::<F>),
         xRead: Some(io::read::<F>),
         xWrite: Some(io::write::<F>),
-        xTruncate: Some(io::truncate),
+        xTruncate: Some(io::truncate::<F>),
         xSync: Some(io::sync::<F>),
         xFileSize: Some(io::file_size::<F>),
         xLock: Some(io::lock),
@@ -92,15 +186,15 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), std
 
     let result = unsafe { ffi::sqlite3_vfs_register(vfs, false as i32) };
     if result != ffi::SQLITE_OK {
-        // TODO: proper error
-        panic!("not ok! {}", result);
+        return Err(RegisterError::Register(result));
     }
 
-    // TODO: return object that allows to unregister (and cleanup the memory)
+    // TODO: return object that allows to unregister (and cleanup the memory)?
 
     Ok(())
 }
 
+// TODO: add to [Vfs]?
 const MAX_PATH_LENGTH: usize = 512;
 
 #[repr(C)]
@@ -114,7 +208,6 @@ struct FileState<F> {
 // Example mem-fs implementation:
 // https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c
 mod vfs {
-
     use super::*;
 
     /// Open a new file handler.
@@ -142,21 +235,28 @@ mod vfs {
         // TODO: any way to use OsStr instead?
         let path = path.to_string_lossy().to_string();
 
-        if let Err(err) = state
-            .vfs
-            .open(path.as_ref(), OpenFlags::from_bits_unchecked(flags))
-            .and_then(|f| {
-                let out_file = (p_file as *mut FileState<F>)
-                    .as_mut()
-                    .ok_or_else(null_ptr_error)?;
-                out_file.base.pMethods = &state.io_methods;
-                // TODO: unwrap
-                out_file.name = CString::new(name.unwrap().to_string()).unwrap().into_raw();
-                out_file.file = Box::into_raw(Box::new(f));
-                out_file.last_error = Rc::into_raw(Rc::clone(&state.last_error));
-                Ok(())
-            })
-        {
+        let opts = match OpenOptions::from_flags(flags) {
+            Some(opts) => opts,
+            None => {
+                state.last_error.set(Some(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "invalid open flags",
+                )));
+                return ffi::SQLITE_CANTOPEN;
+            }
+        };
+
+        if let Err(err) = state.vfs.open(path.as_ref(), opts).and_then(|f| {
+            let out_file = (p_file as *mut FileState<F>)
+                .as_mut()
+                .ok_or_else(null_ptr_error)?;
+            out_file.base.pMethods = &state.io_methods;
+            // TODO: unwrap
+            out_file.name = CString::new(name.unwrap().to_string()).unwrap().into_raw();
+            out_file.file = Box::into_raw(Box::new(f));
+            out_file.last_error = Rc::into_raw(Rc::clone(&state.last_error));
+            Ok(())
+        }) {
             state.last_error.set(Some(err));
             return ffi::SQLITE_CANTOPEN;
         }
@@ -405,7 +505,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("close ({})", CStr::from_ptr(state.name).to_string_lossy());
 
         // TODO: only when free on close is set?
         drop(CString::from_raw(state.name));
@@ -433,7 +533,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("read ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
@@ -478,7 +578,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
-        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("write ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -509,12 +609,34 @@ mod io {
     }
 
     /// Truncate a file.
-    pub unsafe extern "C" fn truncate(
-        _p_file: *mut ffi::sqlite3_file,
-        _size: ffi::sqlite3_int64,
+    pub unsafe extern "C" fn truncate<F: File>(
+        p_file: *mut ffi::sqlite3_file,
+        size: ffi::sqlite3_int64,
     ) -> c_int {
         log::trace!("truncate");
-        todo!("truncate");
+
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_FSYNC,
+        };
+        log::trace!(
+            "truncate ({})",
+            CStr::from_ptr(state.name).to_string_lossy()
+        );
+        let file = match file::<F>(state.file) {
+            Ok(f) => f,
+            Err(err) => {
+                state.set_last_error(err);
+                return ffi::SQLITE_IOERR_FSYNC;
+            }
+        };
+
+        if let Err(err) = file.truncate(size as u64) {
+            state.set_last_error(err);
+            return ffi::SQLITE_IOERR_TRUNCATE;
+        }
+
+        ffi::SQLITE_OK
     }
 
     /// Persist changes to a file.
@@ -525,7 +647,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!("sync ({})", CStr::from_ptr(state.name).to_string_lossy());
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -553,7 +675,10 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        log::trace!("    ({})", CStr::from_ptr(state.name).to_string_lossy());
+        log::trace!(
+            "file_size ({})",
+            CStr::from_ptr(state.name).to_string_lossy()
+        );
         let file = match file::<F>(state.file) {
             Ok(f) => f,
             Err(err) => {
@@ -821,7 +946,54 @@ impl<F> Drop for FileState<F> {
 
 impl File for std::fs::File {
     fn file_size(&self) -> Result<u64, std::io::Error> {
-        Ok(dbg!(self.metadata()?.len()))
+        Ok(self.metadata()?.len())
+    }
+
+    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
+        self.set_len(size)
+    }
+}
+
+impl OpenOptions {
+    fn from_flags(flags: i32) -> Option<Self> {
+        Some(OpenOptions {
+            kind: OpenKind::from_flags(flags)?,
+            access: OpenAccess::from_flags(flags)?,
+            delete_on_close: flags & ffi::SQLITE_OPEN_DELETEONCLOSE > 0,
+        })
+    }
+}
+
+impl OpenKind {
+    fn from_flags(flags: i32) -> Option<Self> {
+        match flags {
+            flags if flags & ffi::SQLITE_OPEN_MAIN_DB > 0 => Some(Self::MainDb),
+            flags if flags & ffi::SQLITE_OPEN_MAIN_JOURNAL > 0 => Some(Self::MainJournal),
+            flags if flags & ffi::SQLITE_OPEN_TEMP_DB > 0 => Some(Self::TempDb),
+            flags if flags & ffi::SQLITE_OPEN_TEMP_JOURNAL > 0 => Some(Self::TempJournal),
+            flags if flags & ffi::SQLITE_OPEN_TRANSIENT_DB > 0 => Some(Self::TransientDb),
+            flags if flags & ffi::SQLITE_OPEN_SUBJOURNAL > 0 => Some(Self::SubJournal),
+            flags if flags & ffi::SQLITE_OPEN_SUPER_JOURNAL > 0 => Some(Self::SuperJournal),
+            flags if flags & ffi::SQLITE_OPEN_WAL > 0 => Some(Self::Wal),
+            _ => None,
+        }
+    }
+}
+
+impl OpenAccess {
+    fn from_flags(flags: i32) -> Option<Self> {
+        match flags {
+            flags
+                if (flags & ffi::SQLITE_OPEN_CREATE > 0)
+                    && (flags & ffi::SQLITE_OPEN_EXCLUSIVE > 0) =>
+            {
+                Some(Self::CreateNew)
+            }
+            flags if flags & ffi::SQLITE_OPEN_CREATE > 0 => Some(Self::Create),
+            flags if flags & ffi::SQLITE_OPEN_READWRITE > 0 => Some(Self::Write),
+            flags if flags & ffi::SQLITE_OPEN_READONLY > 0 => Some(Self::Read),
+            _ => None,
+        }
     }
 }
 
@@ -848,5 +1020,11 @@ impl std::fmt::Display for RegisterError {
                 write!(f, "registering sqlite vfs failed with error code: {}", code)
             }
         }
+    }
+}
+
+impl From<std::ffi::NulError> for RegisterError {
+    fn from(err: std::ffi::NulError) -> Self {
+        Self::Nul(err)
     }
 }
