@@ -9,11 +9,12 @@ repository = "https://github.com/rkusa/sqlite-vfs"
 documentation = "https://docs.rs/sqlite-vfs"
 keywords = ["sqlite", "vfs"]
 
+[workspace]
+members = [
+  "test-vfs",
+]
+
 [dependencies]
-libsqlite3-sys = { version = "0.23", features = ["bundled"] }
 log = "0.4"
 rand = "0.8"
 time = "0.3"
-
-[dev-dependencies]
-rusqlite = { version = "0.26", features = ["bundled"] }

@@ -2,73 +2,47 @@
 //! Create a custom SQLite virtual file system by implementing the [Vfs] trait and registering it
 //! using [register].
 
-use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::ptr::null_mut;
-use std::rc::Rc;
 use std::slice;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use libsqlite3_sys as ffi;
+mod ffi;
 
 /// A file opened by [Vfs].
 pub trait File: Read + Seek + Write {
+    /// Return the current file-size of the file.
     fn file_size(&self) -> Result<u64, std::io::Error>;
+
+    /// Truncat the file to the specified `size`.
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
+
+    /// Lock the object. Returns whether the requested lock could be aquired.
+    fn lock(&mut self, lock: Lock) -> Result<bool, std::io::Error>;
+
+    /// Unlock the object.
+    fn unlock(&mut self, lock: Lock) -> Result<bool, std::io::Error> {
+        self.lock(lock)
+    }
+
+    /// Check if the object holds a [Lock::Reserved], [Lock::Pending] or [Lock::Exclusive] lock.
+    fn is_reserved(&self) -> Result<bool, std::io::Error>;
 }
 
 /// A virtual file system for SQLite.
-///
-/// # Example
-/// This example uses [std::fs] to to persist the database to disk.
-/// ```
-/// # use std::fs;
-/// # use std::path::Path;
-/// #
-/// # use sqlite_vfs::{OpenAccess, OpenOptions, Vfs};
-/// #
-/// struct FsVfs;
-///
-/// impl Vfs for FsVfs {
-///     type File = fs::File;
-///
-///     fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
-///         let mut o = fs::OpenOptions::new();
-///         o.read(true).write(opts.access != OpenAccess::Read);
-///         match opts.access {
-///             OpenAccess::Create => {
-///                 o.create(true);
-///             }
-///             OpenAccess::CreateNew => {
-///                 o.create_new(true);
-///             }
-///             _ => {}
-///         }
-///         let f = o.open(path)?;
-///         Ok(f)
-///     }
-///
-///     fn delete(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-///         std::fs::remove_file(path)
-///     }
-///
-///     fn exists(&self, path: &Path) -> Result<bool, std::io::Error> {
-///         Ok(path.is_file())
-///     }
-/// }
-/// ```
 pub trait Vfs {
     /// The file returned by [Vfs::open].
     type File: File;
 
     /// Open the database object (of type `opts.kind`) at `path`.
-    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error>;
+    fn open(&mut self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error>;
 
     /// Delete the database object at `path`.
     fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
@@ -123,14 +97,55 @@ pub enum OpenAccess {
     CreateNew,
 }
 
+/// The access an object is opened with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Lock {
+    /// No locks are held. The database may be neither read nor written. Any internally cached data
+    /// is considered suspect and subject to verification against the database file before being
+    /// used. Other processes can read or write the database as their own locking states permit.
+    /// This is the default state.
+    None,
+
+    /// The database may be read but not written. Any number of processes can hold [Lock::Shared]
+    /// locks at the same time, hence there can be many simultaneous readers. But no other thread or
+    /// process is allowed to write to the database file while one or more [Lock::Shared] locks are
+    /// active.
+    Shared,
+
+    /// A [Lock::Reserved] lock means that the process is planning on writing to the database file
+    /// at some point in the future but that it is currently just reading from the file. Only a
+    /// single [Lock::Reserved] lock may be active at one time, though multiple [Lock::Shared] locks
+    /// can coexist with a single [Lock::Reserved] lock. [Lock::Reserved] differs from
+    /// [Lock::Pending] in that new [Lock::Shared] locks can be acquired while there is a
+    /// [Lock::Reserved] lock.
+    Reserved,
+
+    /// A [Lock::Pending] lock means that the process holding the lock wants to write to the
+    /// database as soon as possible and is just waiting on all current [Lock::Shared] locks to
+    /// clear so that it can get an [Lock::Exclusive] lock. No new [Lock::Shared] locks are
+    /// permitted against the database if a [Lock::Pending] lock is active, though existing
+    /// [Lock::Shared] locks are allowed to continue.
+    Pending,
+
+    /// An [Lock::Exclusive] lock is needed in order to write to the database file. Only one
+    /// [Lock::Exclusive] lock is allowed on the file and no other locks of any kind are allowed to
+    /// coexist with an [Lock::Exclusive] lock. In order to maximize concurrency, SQLite works to
+    /// minimize the amount of time that [Lock::Exclusive] locks are held.
+    Exclusive,
+}
+
 struct State<V> {
     vfs: V,
     io_methods: ffi::sqlite3_io_methods,
-    last_error: Rc<Cell<Option<std::io::Error>>>,
+    last_error: Arc<Mutex<Option<std::io::Error>>>,
 }
 
 /// Register a virtual file system ([Vfs]) to SQLite.
-pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), RegisterError> {
+pub fn register<F: File, V: Vfs<File = F>>(
+    name: &str,
+    vfs: V,
+    as_default: bool,
+) -> Result<(), RegisterError> {
     let name = ManuallyDrop::new(CString::new(name)?);
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 3,
@@ -183,7 +198,7 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), Reg
         xNextSystemCall: None,
     }));
 
-    let result = unsafe { ffi::sqlite3_vfs_register(vfs, false as i32) };
+    let result = unsafe { ffi::sqlite3_vfs_register(vfs, as_default as i32) };
     if result != ffi::SQLITE_OK {
         return Err(RegisterError::Register(result));
     }
@@ -206,7 +221,7 @@ struct FileState<F> {
 struct FileExt<F> {
     name: String,
     file: F,
-    last_error: Rc<Cell<Option<std::io::Error>>>,
+    last_error: Arc<Mutex<Option<std::io::Error>>>,
 }
 
 // Example mem-fs implementation:
@@ -232,7 +247,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let path = CStr::from_ptr(z_name);
         // TODO: any way to use OsStr instead?
@@ -241,10 +256,10 @@ mod vfs {
         let opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
             None => {
-                state.last_error.set(Some(std::io::Error::new(
+                *(state.last_error.lock().unwrap()) = Some(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "invalid open flags",
-                )));
+                ));
                 return ffi::SQLITE_CANTOPEN;
             }
         };
@@ -257,11 +272,11 @@ mod vfs {
             out_file.ext.write(FileExt {
                 name: name.to_string(),
                 file,
-                last_error: Rc::clone(&state.last_error),
+                last_error: Arc::clone(&state.last_error),
             });
             Ok(())
         }) {
-            state.last_error.set(Some(err));
+            *(state.last_error.lock().unwrap()) = Some(err);
             return ffi::SQLITE_CANTOPEN;
         }
 
@@ -286,7 +301,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_DELETE,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let path = CStr::from_ptr(z_path);
         // TODO: any way to use OsStr instead?
@@ -298,7 +313,7 @@ mod vfs {
                 if err.kind() == ErrorKind::NotFound {
                     ffi::SQLITE_OK
                 } else {
-                    state.last_error.set(Some(err));
+                    *(state.last_error.lock().unwrap()) = Some(err);
                     ffi::SQLITE_DELETE
                 }
             }
@@ -324,7 +339,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let path = CStr::from_ptr(z_path);
         // TODO: any way to use OsStr instead?
@@ -342,7 +357,7 @@ mod vfs {
             *p_res_out = ok as i32;
             Ok(())
         }) {
-            state.last_error.set(Some(err));
+            *(state.last_error.lock().unwrap()) = Some(err);
             return ffi::SQLITE_IOERR_ACCESS;
         }
 
@@ -365,7 +380,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let name = name.to_bytes_with_nul();
         if name.len() > n_out as usize || name.len() > MAX_PATH_LENGTH {
@@ -451,7 +466,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
         *p_time_out = 2440587.5 + now / 864.0e5;
@@ -467,7 +482,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        if let Some(err) = state.last_error.take() {
+        if let Some(err) = state.last_error.lock().unwrap().take() {
             let msg = match CString::new(err.to_string()) {
                 Ok(msg) => msg,
                 Err(_) => return ffi::SQLITE_ERROR,
@@ -493,7 +508,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        state.last_error.take();
+        state.last_error.lock().unwrap().take();
 
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
         *p = ((2440587.5 + now / 864.0e5) * 864.0e5) as i64;
@@ -513,6 +528,7 @@ mod io {
         if let Some(f) = (p_file as *mut FileState<F>).as_mut() {
             let ext = mem::replace(&mut f.ext, MaybeUninit::uninit());
             let mut ext = ext.assume_init(); // extract the value to drop it
+            log::trace!("close ({})", ext.name);
             ext.unset_last_error();
         }
 
@@ -661,33 +677,58 @@ mod io {
     }
 
     /// Lock a file.
-    pub unsafe extern "C" fn lock<F>(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
+    pub unsafe extern "C" fn lock<F: File>(p_file: *mut ffi::sqlite3_file, e_lock: c_int) -> c_int {
         log::trace!("lock");
 
-        // reset last error
-        if file_state::<F>(p_file, true).is_err() {
-            return ffi::SQLITE_IOERR_LOCK;
-        }
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_LOCK,
+        };
+        log::trace!("lock ({})", state.name);
 
-        // TODO: implement locking
-        ffi::SQLITE_OK
+        let lock = match Lock::from_i32(e_lock) {
+            Some(lock) => lock,
+            None => return ffi::SQLITE_IOERR_LOCK,
+        };
+        match state.file.lock(lock) {
+            Ok(true) => ffi::SQLITE_OK,
+            Ok(false) => ffi::SQLITE_BUSY,
+            Err(err) => {
+                state.set_last_error(err);
+                ffi::SQLITE_IOERR_LOCK
+            }
+        }
     }
 
     /// Unlock a file.
-    pub unsafe extern "C" fn unlock<F>(p_file: *mut ffi::sqlite3_file, _e_lock: c_int) -> c_int {
+    pub unsafe extern "C" fn unlock<F: File>(
+        p_file: *mut ffi::sqlite3_file,
+        e_lock: c_int,
+    ) -> c_int {
         log::trace!("unlock");
 
-        // reset last error
-        if file_state::<F>(p_file, true).is_err() {
-            return ffi::SQLITE_IOERR_UNLOCK;
-        }
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_UNLOCK,
+        };
+        log::trace!("unlock ({})", state.name);
 
-        // TODO: implement locking
-        ffi::SQLITE_OK
+        let lock = match Lock::from_i32(e_lock) {
+            Some(lock) => lock,
+            None => return ffi::SQLITE_IOERR_UNLOCK,
+        };
+        match state.file.unlock(lock) {
+            Ok(true) => ffi::SQLITE_OK,
+            Ok(false) => ffi::SQLITE_BUSY,
+            Err(err) => {
+                state.set_last_error(err);
+                ffi::SQLITE_IOERR_UNLOCK
+            }
+        }
     }
 
-    /// Check if another file-handle holds a RESERVED lock on a file.
-    pub unsafe extern "C" fn check_reserved_lock<F>(
+    /// Check if another file-handle holds a [Lock::Reserved] lock on a file.
+    pub unsafe extern "C" fn check_reserved_lock<F: File>(
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
@@ -697,18 +738,17 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
+        log::trace!("unlock ({})", state.name);
 
-        match p_res_out.as_mut() {
-            Some(p_res_out) => {
-                *p_res_out = false as i32;
-            }
-            None => {
-                state.set_last_error(null_ptr_error());
-                return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK;
-            }
+        if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
+            let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
+            *p_res_out = is_reserved as c_int;
+            Ok(())
+        }) {
+            state.set_last_error(err);
+            return ffi::SQLITE_IOERR_UNLOCK;
         }
 
-        // TODO: implement locking
         ffi::SQLITE_OK
     }
 
@@ -856,11 +896,11 @@ mod io {
 
 impl<F> FileExt<F> {
     fn unset_last_error(&mut self) {
-        self.last_error.take();
+        self.last_error.lock().unwrap().take();
     }
 
     fn set_last_error(&mut self, err: std::io::Error) {
-        self.last_error.set(Some(err));
+        *(self.last_error.lock().unwrap()) = Some(err);
     }
 }
 
@@ -888,16 +928,6 @@ unsafe fn file_state<'a, F>(
         ext.unset_last_error();
     }
     Ok(ext)
-}
-
-impl File for std::fs::File {
-    fn file_size(&self) -> Result<u64, std::io::Error> {
-        Ok(self.metadata()?.len())
-    }
-
-    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
-        self.set_len(size)
-    }
 }
 
 impl OpenOptions {
@@ -943,6 +973,41 @@ impl OpenAccess {
     }
 }
 
+impl Lock {
+    fn from_i32(lock: i32) -> Option<Self> {
+        Some(match lock {
+            ffi::SQLITE_LOCK_NONE => Self::None,
+            ffi::SQLITE_LOCK_SHARED => Self::Shared,
+            ffi::SQLITE_LOCK_RESERVED => Self::Reserved,
+            ffi::SQLITE_LOCK_PENDING => Self::Pending,
+            ffi::SQLITE_LOCK_EXCLUSIVE => Self::Exclusive,
+            _ => return None,
+        })
+    }
+
+    fn to_i32(self) -> i32 {
+        match self {
+            Self::None => ffi::SQLITE_LOCK_NONE,
+            Self::Shared => ffi::SQLITE_LOCK_SHARED,
+            Self::Reserved => ffi::SQLITE_LOCK_RESERVED,
+            Self::Pending => ffi::SQLITE_LOCK_PENDING,
+            Self::Exclusive => ffi::SQLITE_LOCK_EXCLUSIVE,
+        }
+    }
+}
+
+impl PartialOrd for Lock {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_i32().partial_cmp(&other.to_i32())
+    }
+}
+
+impl Default for Lock {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Debug)]
 pub enum RegisterError {
     Nul(std::ffi::NulError),
@@ -972,5 +1037,18 @@ impl std::fmt::Display for RegisterError {
 impl From<std::ffi::NulError> for RegisterError {
     fn from(err: std::ffi::NulError) -> Self {
         Self::Nul(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lock_order() {
+        assert!(Lock::None < Lock::Shared);
+        assert!(Lock::Shared < Lock::Reserved);
+        assert!(Lock::Reserved < Lock::Pending);
+        assert!(Lock::Pending < Lock::Exclusive);
     }
 }
