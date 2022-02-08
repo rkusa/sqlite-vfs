@@ -169,16 +169,16 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), Reg
         xOpen: Some(vfs::open::<F, V>),
         xDelete: Some(vfs::delete::<V>),
         xAccess: Some(vfs::access::<V>),
-        xFullPathname: Some(vfs::full_pathname),
+        xFullPathname: Some(vfs::full_pathname::<V>),
         xDlOpen: Some(vfs::dlopen),
         xDlError: Some(vfs::dlerror),
         xDlSym: Some(vfs::dlsym),
         xDlClose: Some(vfs::dlclose),
         xRandomness: Some(vfs::randomness),
         xSleep: Some(vfs::sleep),
-        xCurrentTime: Some(vfs::current_time),
-        xGetLastError: Some(vfs::get_last_error),
-        xCurrentTimeInt64: Some(vfs::current_time_int64),
+        xCurrentTime: Some(vfs::current_time::<V>),
+        xGetLastError: Some(vfs::get_last_error::<V>),
+        xCurrentTimeInt64: Some(vfs::current_time_int64::<V>),
         xSetSystemCall: None,
         xGetSystemCall: None,
         xNextSystemCall: None,
@@ -348,7 +348,7 @@ mod vfs {
     /// Populate buffer `z_out` with the full canonical pathname corresponding to the pathname in
     /// `z_path`. `z_out` is guaranteed to point to a buffer of at least (INST_MAX_PATHNAME+1)
     /// bytes.
-    pub unsafe extern "C" fn full_pathname(
+    pub unsafe extern "C" fn full_pathname<V>(
         p_vfs: *mut ffi::sqlite3_vfs,
         z_path: *const c_char,
         n_out: c_int,
@@ -357,7 +357,7 @@ mod vfs {
         let name = CStr::from_ptr(z_path);
         log::trace!("full_pathname name={}", name.to_string_lossy());
 
-        let state = match vfs_state::<()>(p_vfs) {
+        let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
@@ -437,13 +437,13 @@ mod vfs {
     }
 
     /// Return the current time as a Julian Day number in `p_time_out`.
-    pub unsafe extern "C" fn current_time(
+    pub unsafe extern "C" fn current_time<V>(
         p_vfs: *mut ffi::sqlite3_vfs,
         p_time_out: *mut f64,
     ) -> c_int {
         log::trace!("current_time");
 
-        let state = match vfs_state::<()>(p_vfs) {
+        let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
@@ -454,12 +454,12 @@ mod vfs {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn get_last_error(
+    pub unsafe extern "C" fn get_last_error<V>(
         p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
         z_err_msg: *mut c_char,
     ) -> c_int {
-        let state = match vfs_state::<()>(p_vfs) {
+        let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
@@ -479,10 +479,13 @@ mod vfs {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn current_time_int64(p_vfs: *mut ffi::sqlite3_vfs, p: *mut i64) -> i32 {
+    pub unsafe extern "C" fn current_time_int64<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        p: *mut i64,
+    ) -> i32 {
         log::trace!("current_time_int64");
 
-        let state = match vfs_state::<()>(p_vfs) {
+        let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
