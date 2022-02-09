@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
 # create non-root user to execute the tests (some tests fail if executed as root)
 ARG UID=1000
 RUN addgroup -gid 1000 --system sqlite && \
-    adduser -uid $UID --disabled-password --system --gid 1000 --home /home/sqlite --no-create-home sqlite
+    adduser -uid $UID --disabled-password --system --gid 1000 --home /home/sqlite sqlite
 USER $UID
 WORKDIR /home/sqlite
 
