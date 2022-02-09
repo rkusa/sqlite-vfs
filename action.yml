@@ -1,5 +1,5 @@
-name: 'SQLite Tests'
-description: 'Run SQLite\'s TCL tests against a custom VFS'
+name: SQLite Tests
+description: Run SQLite's TCL tests against a custom VFS
 runs:
-  using: 'docker'
-  image: 'test-vfs/Dockerfile'
+  using: docker
+  image: test-vfs/Dockerfile
