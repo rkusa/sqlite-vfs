@@ -401,7 +401,7 @@ mod vfs {
         _p_vfs: *mut ffi::sqlite3_vfs,
         _p: *mut c_void,
         _z_sym: *const c_char,
-    ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const i8)> {
+    ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const c_char)> {
         log::trace!("dlsym");
 
         None
