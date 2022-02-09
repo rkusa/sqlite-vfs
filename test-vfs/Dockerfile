@@ -7,10 +7,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # create non-root user to execute the tests (some tests fail if executed as root)
-ARG UID=1000
 RUN addgroup -gid 1000 --system sqlite && \
-    adduser -uid $UID --disabled-password --system --gid 1000 --home /home/sqlite sqlite
-USER $UID
+    adduser -uid 1000 --system --gid 1000 --home /home/sqlite --shell /bin/bash sqlite && \
+    passwd -d sqlite
 WORKDIR /home/sqlite
 
 # build a stub of the test vfs, which allows to build and cache sqlite before building the actual
@@ -28,6 +27,7 @@ RUN cd build && make \
     LIBS="-L/home/sqlite/test-vfs/target/debug/ -ltest_vfs" \
     USE_AMALGAMATION=0 \
     testfixture
+RUN chown -R sqlite:sqlite /home/sqlite/build
 RUN rm -rf /home/sqlite/test-vfs
 
 RUN mkdir /home/sqlite/lib/

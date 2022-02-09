@@ -7,5 +7,6 @@ cp target/debug/libtest_vfs.so /home/sqlite/lib/
 
 cd /home/sqlite/build
 # s/extraquick.test/all.test/
-./testfixture ../sqlite-src-3370200/test/extraquick.test \
-  --verbose=file --output=test-out.txt
+su \
+  -c "./testfixture ../sqlite-src-3370200/test/extraquick.test --verbose=file --output=test-out.txt" \
+  sqlite
