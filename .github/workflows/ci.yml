@@ -38,4 +38,4 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run SQLite tests
-        uses: ./
+        uses: ./test-vfs
