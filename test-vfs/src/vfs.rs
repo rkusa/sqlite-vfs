@@ -19,10 +19,18 @@ pub struct File {
     state: Arc<Mutex<FileState>>,
 }
 
-#[derive(Debug, Default)]
-struct FileState {
-    n_wr_lock: usize,
-    n_rd_lock: usize,
+#[derive(Debug, Clone, Copy)]
+enum FileState {
+    /// The file is shared for reading between `count` locks.
+    Read { count: usize },
+    /// The file has  [Lock::Reserved] lock, so new and existing read locks are still allowed, just
+    /// not another [Lock::Reserved] (or write) lock.
+    Reserved { count: usize },
+    /// The file has a [Lock::Pending] lock, so new read locks are not allowed, and it is awaiting
+    /// for the read `count` to get to zero.
+    Pending { count: usize },
+    /// The file has an [Lock::Exclusive] lock.
+    Exclusive,
 }
 
 impl Vfs for FsVfs {
@@ -114,7 +122,6 @@ impl sqlite_vfs::File for File {
         self.inner.set_len(size)
     }
 
-    // adapted from memdb: https://github.com/sqlite/sqlite/blob/master/src/memdb.c
     fn lock(&mut self, lock: sqlite_vfs::Lock) -> Result<bool, std::io::Error> {
         let mut state = self.state.lock().unwrap();
         // eprintln!("lock {:?} (from {:?})", lock, self.lock);
@@ -123,40 +130,8 @@ impl sqlite_vfs::File for File {
             return Ok(true);
         }
 
-        match lock {
-            Lock::Reserved | Lock::Pending | Lock::Exclusive => {
-                if self.lock <= Lock::Shared {
-                    if state.n_wr_lock > 0 {
-                        return Ok(false);
-                    } else {
-                        state.n_wr_lock = 1;
-                        // eprintln!("n_wr_lock = 1");
-                    }
-                }
-            }
-            Lock::Shared => {
-                if self.lock > Lock::Shared {
-                    assert_eq!(state.n_wr_lock, 1);
-                    state.n_wr_lock = 0;
-
-                    // eprintln!("n_wr_lock = 0");
-                } else if state.n_wr_lock > 0 {
-                    return Ok(false);
-                } else {
-                    state.n_rd_lock += 1;
-                    // eprintln!("n_rd_lock++");
-                }
-            }
-            Lock::None => {
-                if self.lock > Lock::Shared {
-                    assert_eq!(state.n_wr_lock, 1);
-                    state.n_wr_lock = 0;
-                    // eprintln!("n_wr_lock = 0");
-                }
-                assert!(state.n_rd_lock > 0);
-                state.n_rd_lock -= 1;
-                // eprintln!("n_rd_lock--");
-            }
+        if !state.transition(self.lock, lock) {
+            return Ok(false);
         }
 
         self.lock = lock;
@@ -166,5 +141,132 @@ impl sqlite_vfs::File for File {
 
     fn is_reserved(&self) -> Result<bool, std::io::Error> {
         Ok(self.lock >= Lock::Reserved)
+    }
+}
+
+impl FileState {
+    // It's not pretty but works and is only meant for testing purposes anyway ...
+    fn transition(&mut self, from: Lock, to: Lock) -> bool {
+        *self = match (*self, from, to) {
+            // no change, from and to are the same
+            (_, Lock::None, Lock::None)
+            | (_, Lock::Shared, Lock::Shared)
+            | (_, Lock::Reserved, Lock::Reserved)
+            | (_, Lock::Pending, Lock::Pending)
+            | (_, Lock::Exclusive, Lock::Exclusive) => return true,
+
+            (FileState::Read { count }, Lock::None, Lock::Shared) => {
+                FileState::Read { count: count + 1 }
+            }
+            (FileState::Read { count }, Lock::None, Lock::Reserved) => {
+                FileState::Reserved { count }
+            }
+            (FileState::Read { count }, Lock::None, Lock::Pending) => FileState::Pending { count },
+            (FileState::Read { count }, Lock::None, Lock::Exclusive) => {
+                if count == 0 {
+                    FileState::Exclusive
+                } else {
+                    return false;
+                }
+            }
+
+            (FileState::Read { count }, Lock::Shared, Lock::None) => {
+                FileState::Read { count: count - 1 }
+            }
+            (FileState::Read { count }, Lock::Shared, Lock::Reserved) => {
+                FileState::Reserved { count: count - 1 }
+            }
+            (FileState::Read { count }, Lock::Shared, Lock::Pending) => {
+                FileState::Pending { count: count - 1 }
+            }
+            (FileState::Read { count }, Lock::Shared, Lock::Exclusive) => {
+                if count == 1 {
+                    FileState::Exclusive
+                } else {
+                    return false;
+                }
+            }
+
+            // transition from reserved lock
+            (FileState::Reserved { count }, Lock::None, Lock::Shared) => {
+                FileState::Reserved { count: count + 1 }
+            }
+            (
+                FileState::Reserved { .. },
+                Lock::None | Lock::Shared,
+                Lock::Reserved | Lock::Pending | Lock::Exclusive,
+            ) => return false,
+
+            (FileState::Reserved { count }, Lock::Shared, Lock::None) => {
+                FileState::Reserved { count: count - 1 }
+            }
+            (FileState::Reserved { count }, Lock::Reserved, Lock::None) => {
+                FileState::Read { count }
+            }
+            (FileState::Reserved { count }, Lock::Reserved, Lock::Shared) => {
+                FileState::Read { count: count + 1 }
+            }
+            (FileState::Reserved { count }, Lock::Reserved, Lock::Pending) => {
+                FileState::Pending { count }
+            }
+            (FileState::Reserved { count }, Lock::Reserved, Lock::Exclusive) => {
+                if count == 0 {
+                    FileState::Exclusive
+                } else {
+                    return false;
+                }
+            }
+
+            // transition from pending lock
+            (FileState::Pending { count }, Lock::Pending, Lock::None) => FileState::Read { count },
+            (FileState::Pending { count }, Lock::Pending, Lock::Shared) => {
+                FileState::Read { count: count + 1 }
+            }
+            (FileState::Pending { count }, Lock::Pending, Lock::Reserved) => {
+                FileState::Reserved { count }
+            }
+            (FileState::Pending { count }, Lock::Pending, Lock::Exclusive) => {
+                if count == 0 {
+                    FileState::Exclusive
+                } else {
+                    return false;
+                }
+            }
+
+            // transition from exclusive lock
+            (FileState::Exclusive, Lock::Exclusive, Lock::None) => FileState::Read { count: 0 },
+            (FileState::Exclusive, Lock::Exclusive, Lock::Shared) => FileState::Read { count: 1 },
+            (FileState::Exclusive, Lock::Exclusive, Lock::Reserved) => {
+                FileState::Reserved { count: 0 }
+            }
+            (FileState::Exclusive, Lock::Exclusive, Lock::Pending) => {
+                FileState::Pending { count: 0 }
+            }
+
+            // drain readers while in pending state
+            (FileState::Pending { count }, Lock::Shared, Lock::None) => {
+                FileState::Pending { count: count - 1 }
+            }
+
+            // no new locks allowed while in Pending or Exclusive
+            (FileState::Pending { .. }, Lock::None | Lock::Shared, _) => return false,
+            (FileState::Exclusive, Lock::None, _) => return false,
+
+            // invalid state and from lock combination
+            (FileState::Read { .. }, Lock::Reserved | Lock::Pending | Lock::Exclusive, _)
+            | (FileState::Reserved { .. }, Lock::Pending | Lock::Exclusive, _)
+            | (FileState::Pending { .. }, Lock::Reserved | Lock::Exclusive, _)
+            | (FileState::Exclusive, Lock::Shared | Lock::Reserved | Lock::Pending, _) => {
+                unreachable!("state does not match current lock")
+            }
+        };
+
+        true
+    }
+}
+
+impl Default for FileState {
+    fn default() -> Self {
+        Self::Read { count: 0 }
     }
 }
