@@ -23,7 +23,7 @@ RUN curl -LO https://www.sqlite.org/2022/sqlite-src-3370200.zip && unzip sqlite-
 # build sqlite test programs
 RUN mkdir build && cd build && ../sqlite-src-3370200/configure
 RUN cd build && make \
-    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs" \
+    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs -DSQLITE_OMIT_WAL" \
     LIBS="-L/home/sqlite/test-vfs/target/debug/ -ltest_vfs" \
     USE_AMALGAMATION=0 \
     testfixture
