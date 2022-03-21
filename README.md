@@ -6,4 +6,11 @@ Build SQLite virtual file systems (VFS) by implementing a simple Rust trait.
 
 This library is build for my own use-case. It doesn't expose everything a SQLite VFS provides (e.g. memory mapped files). Feel free to propose additions if the current state doesn't work for your use-case.
 
-**Disclaimer:** This library uses _unsafe_ Rust to call SQLite C functions. I am neither an SQLite nor a _unsafe_ Rust expert. I am only using this library for experiments (and not in any production capacity) right now.
+## Status
+
+This library is still in _prototype_ state and not ready to be used (except for maybe prototypes). While progress will be slow, it is actively worked on.
+
+- ✅ Good enough for single-threaded experiments like [`do-sqlite`](https://github.com/rkusa/do-sqlite).
+- ❌ It is not passing the SQLite's TCL test harness yet (WIP: [#1](https://github.com/rkusa/sqlite-vfs/pull/1)).
+- ⚠️ It uses `unsafe` Rust, which hasn't been peer-reviewed yet.
+- ⚠️ It is not used in any production-capacity yet.
