@@ -25,6 +25,10 @@ pub trait DatabaseHandle: Read + Seek + Write {
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
 
     /// Lock the database. Returns whether the requested lock could be aquired.
+    /// Locking sequence:
+    /// - The lock is nevered moved from [Lock::None] to anything higher than [Lock::Shared].
+    /// - A [Lock::Pending] is never requested explicitly.
+    /// - A [Lock::Shared] is always held when a [Lock::Reserved] lock is requested
     fn lock(&mut self, lock: Lock) -> Result<bool, std::io::Error>;
 
     /// Unlock the database.
@@ -32,7 +36,11 @@ pub trait DatabaseHandle: Read + Seek + Write {
         self.lock(lock)
     }
 
-    /// Return the current [Lock] of the database (not just the handle).
+    /// Check if the database this handle points to holds a [Lock::Reserved], [Lock::Pending] or
+    /// [Lock::Exclusive] lock.
+    fn is_reserved(&self) -> Result<bool, std::io::Error>;
+
+    /// Return the current [Lock] of the this handle.
     fn current_lock(&self) -> Result<Lock, std::io::Error>;
 }
 
@@ -712,9 +720,9 @@ mod io {
         };
         log::trace!("unlock ({})", state.name);
 
-        if let Err(err) = state.file.current_lock().and_then(|lock| {
+        if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
-            *p_res_out = (lock >= Lock::Reserved) as c_int;
+            *p_res_out = is_reserved as c_int;
             Ok(())
         }) {
             return state.set_last_error(ffi::SQLITE_IOERR_UNLOCK, err);
@@ -735,6 +743,8 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_NOTFOUND,
         };
+
+        // eprintln!("file_control: {}", op);
 
         // Docs: https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html
         match op {
