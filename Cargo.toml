@@ -18,3 +18,9 @@ members = [
 log = "0.4"
 rand = "0.8"
 time = "0.3"
+
+[features]
+default = []
+
+# Only enable when building with the included `./test-vfs`.
+sqlite_test = []

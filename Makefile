@@ -9,7 +9,7 @@ test: test-vfs/.dockerbuild
 		--mount type=bind,src=$(shell pwd)/target/x86_64-unknown-linux-gnu,dst=/github/workspace/target \
 		-t sqlite-vfs-test
 
-test-vfs/.dockerbuild: test-vfs/Dockerfile test-vfs/entrypoint.sh test-vfs/docker/test-vfs/Cargo.toml test-vfs/docker/test-vfs/src/*.rs
+test-vfs/.dockerbuild: test-vfs/Dockerfile test-vfs/entrypoint.sh test-vfs/docker/test-vfs/Cargo.toml test-vfs/patch/* test-vfs/docker/test-vfs/src/*.rs
 	docker build --platform $(PLATFORM) \
 		-f test-vfs/Dockerfile \
 		--progress=plain \

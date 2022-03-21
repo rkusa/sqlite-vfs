@@ -12,16 +12,20 @@ RUN addgroup -gid 1000 --system sqlite && \
     passwd -d sqlite
 WORKDIR /home/sqlite
 
+# download and extract sqlite source
+RUN curl -LO https://www.sqlite.org/2022/sqlite-src-3370200.zip && unzip sqlite-src-3370200.zip
+
 # build a stub of the test vfs, which allows to build and cache sqlite before building the actual
 # test vfs
 ADD --chown=sqlite docker/test-vfs /home/sqlite/test-vfs
 RUN cd test-vfs && cargo build
 
-# download and extract sqlite source
-RUN curl -LO https://www.sqlite.org/2022/sqlite-src-3370200.zip && unzip sqlite-src-3370200.zip
-
 # build sqlite test programs
+COPY patch/Makefile.in.patch Makefile.in.patch
+RUN patch -u sqlite-src-3370200/Makefile.in Makefile.in.patch
 RUN mkdir build && cd build && ../sqlite-src-3370200/configure
+RUN cat build/Makefile
+COPY patch/test_ext.c sqlite-src-3370200/src/test_ext.c
 RUN cd build && make \
     OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs -DSQLITE_OMIT_WAL" \
     LIBS="-L/home/sqlite/test-vfs/target/debug/ -ltest_vfs" \

@@ -21,6 +21,10 @@ pub trait DatabaseHandle: Read + Seek + Write {
     /// Return the current file-size of the database.
     fn file_size(&self) -> Result<u64, std::io::Error>;
 
+    /// Make sure all writes are committed to the underlying storage. If `data_only` is set to
+    /// `true`, only the data and not the metadata (like size, access time, etc) should be synced.
+    fn sync(&self, data_only: bool) -> Result<(), std::io::Error>;
+
     /// Truncat the database file to the specified `size`.
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
 
@@ -618,7 +622,7 @@ mod io {
     /// Persist changes to a file.
     pub unsafe extern "C" fn sync<F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
-        _flags: c_int,
+        flags: c_int,
     ) -> c_int {
         log::trace!("sync");
 
@@ -628,7 +632,20 @@ mod io {
         };
         log::trace!("sync ({})", state.name);
 
+        #[cfg(feature = "sqlite_test")]
+        {
+            let is_full_sync = flags & 0x0F == ffi::SQLITE_SYNC_FULL;
+            if is_full_sync {
+                ffi::sqlite3_inc_fullsync_count();
+            }
+            ffi::sqlite3_inc_sync_count();
+        }
+
         if let Err(err) = state.file.flush() {
+            return state.set_last_error(ffi::SQLITE_IOERR_FSYNC, err);
+        }
+
+        if let Err(err) = state.file.sync(flags & ffi::SQLITE_SYNC_DATAONLY > 0) {
             return state.set_last_error(ffi::SQLITE_IOERR_FSYNC, err);
         }
 

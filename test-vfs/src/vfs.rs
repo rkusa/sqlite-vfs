@@ -122,6 +122,14 @@ impl sqlite_vfs::DatabaseHandle for FileHandle {
         Ok(self.inner.metadata()?.len())
     }
 
+    fn sync(&self, data_only: bool) -> Result<(), std::io::Error> {
+        if data_only {
+            self.inner.sync_data()
+        } else {
+            self.inner.sync_all()
+        }
+    }
+
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
         self.inner.set_len(size)
     }

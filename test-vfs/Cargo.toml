@@ -7,12 +7,4 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# libsqlite3-sys = { version = "0.23", default-features = false, features = ["pkg-config", "vcpkg", "bundled_bindings"] }
-sqlite-vfs = { path = "../", default-features = false }
-
-[dev-dependencies]
-rusqlite = { version = "0.26", features = ["bundled"] }
-
-# [features]
-# default = ["bundled"]
-# bundled = ["libsqlite3-sys/bundled", "sqlite-vfs/bundled"]
+sqlite-vfs = { path = "../", default-features = false, features = ["sqlite_test"] }

@@ -1,5 +1,11 @@
 #![allow(non_snake_case, non_camel_case_types, unused)]
 
+#[cfg(feature = "sqlite_test")]
+extern "C" {
+    pub fn sqlite3_inc_sync_count();
+    pub fn sqlite3_inc_fullsync_count();
+}
+
 // Excerpt of
 // github.com/rusqlite/rusqlite/blob/master/libsqlite3-sys/sqlite3/bindgen_bundled_version.rs
 
