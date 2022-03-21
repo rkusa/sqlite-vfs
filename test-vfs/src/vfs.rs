@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::{fs, io};
 
 use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs};
 
@@ -13,8 +14,8 @@ pub struct FsVfs {
     state: HashMap<PathBuf, Weak<Mutex<FileState>>>,
 }
 
-pub struct File {
-    inner: fs::File,
+pub struct FileHandle {
+    inner: File,
     lock: Lock,
     state: Arc<Mutex<FileState>>,
 }
@@ -34,9 +35,9 @@ enum FileState {
 }
 
 impl Vfs for FsVfs {
-    type File = File;
+    type Handle = FileHandle;
 
-    fn open(&mut self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
+    fn open(&mut self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
         match opts.access {
@@ -59,7 +60,7 @@ impl Vfs for FsVfs {
             state
         };
 
-        Ok(File {
+        Ok(FileHandle {
             inner: f,
             lock: Lock::default(),
             state,
@@ -75,7 +76,7 @@ impl Vfs for FsVfs {
     }
 }
 
-impl io::Read for File {
+impl io::Read for FileHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
@@ -93,7 +94,7 @@ impl io::Read for File {
     }
 }
 
-impl io::Write for File {
+impl io::Write for FileHandle {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
@@ -107,13 +108,13 @@ impl io::Write for File {
     }
 }
 
-impl io::Seek for File {
+impl io::Seek for FileHandle {
     fn seek(&mut self, from: io::SeekFrom) -> Result<u64, io::Error> {
         self.inner.seek(from)
     }
 }
 
-impl sqlite_vfs::File for File {
+impl sqlite_vfs::DatabaseHandle for FileHandle {
     fn file_size(&self) -> Result<u64, std::io::Error> {
         Ok(self.inner.metadata()?.len())
     }
@@ -139,8 +140,19 @@ impl sqlite_vfs::File for File {
         Ok(true)
     }
 
-    fn is_reserved(&self) -> Result<bool, std::io::Error> {
-        Ok(self.lock >= Lock::Reserved)
+    fn current_lock(&self) -> Result<Lock, std::io::Error> {
+        Ok(match &*self.state.lock().unwrap() {
+            FileState::Read { count } => {
+                if *count == 0 {
+                    Lock::None
+                } else {
+                    Lock::Shared
+                }
+            }
+            FileState::Reserved { .. } => Lock::Reserved,
+            FileState::Pending { .. } => Lock::Pending,
+            FileState::Exclusive => Lock::Exclusive,
+        })
     }
 }
 
