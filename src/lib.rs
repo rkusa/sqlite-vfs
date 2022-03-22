@@ -46,6 +46,11 @@ pub trait DatabaseHandle: Read + Seek + Write {
 
     /// Return the current [Lock] of the this handle.
     fn current_lock(&self) -> Result<Lock, std::io::Error>;
+
+    /// Change the chunk size of the database to `chunk_size`.
+    fn set_chunk_size(&self, _chunk_size: usize) -> Result<(), std::io::Error> {
+        Ok(())
+    }
 }
 
 /// A virtual file system for SQLite.
@@ -809,13 +814,27 @@ mod io {
             // Request that the VFS extends and truncates the database file in chunks of a size
             // specified by the user. Return an error as this is not forwarded to the [Vfs]  trait
             // right now.
-            ffi::SQLITE_FCNTL_CHUNK_SIZE => state.set_last_error(
-                ffi::SQLITE_NOTFOUND,
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "the custom vfs does not support changing the database chunk size",
-                ),
-            ),
+            ffi::SQLITE_FCNTL_CHUNK_SIZE => {
+                let chunk_size = match (p_arg as *mut i32)
+                    .as_ref()
+                    .cloned()
+                    .and_then(|s| usize::try_from(s).ok())
+                {
+                    Some(chunk_size) => chunk_size,
+                    None => {
+                        return state.set_last_error(
+                            ffi::SQLITE_NOTFOUND,
+                            std::io::Error::new(std::io::ErrorKind::Other, "expect chunk_size arg"),
+                        );
+                    }
+                };
+
+                if let Err(err) = state.file.set_chunk_size(chunk_size) {
+                    return state.set_last_error(ffi::SQLITE_ERROR, err);
+                }
+
+                ffi::SQLITE_OK
+            }
 
             // Configure automatic retry counts and intervals for certain disk I/O operations for
             // the windows VFS in order to provide robustness in the presence of anti-virus
