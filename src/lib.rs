@@ -256,7 +256,7 @@ mod vfs {
         z_name: *const c_char,
         p_file: *mut ffi::sqlite3_file,
         flags: c_int,
-        _p_out_flags: *mut c_int,
+        p_out_flags: *mut c_int,
     ) -> c_int {
         if z_name.is_null() {
             return ffi::SQLITE_CANTOPEN;
@@ -273,31 +273,54 @@ mod vfs {
         // TODO: any way to use OsStr instead?
         let path = path.to_string_lossy().to_string();
 
-        let opts = match OpenOptions::from_flags(flags) {
+        let mut opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
             None => {
                 return state.set_last_error(
                     ffi::SQLITE_CANTOPEN,
                     std::io::Error::new(std::io::ErrorKind::Other, "invalid open flags"),
+                );
+            }
+        };
+
+        let out_file = match (p_file as *mut FileState<F>).as_mut() {
+            Some(f) => f,
+            None => {
+                return state.set_last_error(
+                    ffi::SQLITE_ERROR,
+                    std::io::Error::new(std::io::ErrorKind::Other, "invalid file pointer"),
                 )
             }
         };
 
-        if let Err(err) = state.vfs.open(path.as_ref(), opts).and_then(|file| {
-            let out_file = (p_file as *mut FileState<F>)
-                .as_mut()
-                .ok_or_else(null_ptr_error)?;
-            out_file.base.pMethods = &state.io_methods;
-            out_file.ext.write(FileExt {
-                vfs_name: state.name.clone(),
-                name: name.to_string(),
-                file,
-                last_error: Arc::clone(&state.last_error),
-            });
-            Ok(())
-        }) {
-            return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
+        let file = match state.vfs.open(path.as_ref(), opts.clone()) {
+            Ok(f) => f,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
+                    // Try again as readonly
+                    opts.access = OpenAccess::Read;
+                    if let Ok(f) = state.vfs.open(path.as_ref(), opts.clone()) {
+                        f
+                    } else {
+                        return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
+                    }
+                } else {
+                    return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
+                }
+            }
+        };
+
+        if let Some(p_out_flags) = p_out_flags.as_mut() {
+            *p_out_flags = opts.to_flags();
         }
+
+        out_file.base.pMethods = &state.io_methods;
+        out_file.ext.write(FileExt {
+            vfs_name: state.name.clone(),
+            name: name.to_string(),
+            file,
+            last_error: Arc::clone(&state.last_error),
+        });
 
         ffi::SQLITE_OK
     }
@@ -1082,6 +1105,16 @@ impl OpenOptions {
             delete_on_close: flags & ffi::SQLITE_OPEN_DELETEONCLOSE > 0,
         })
     }
+
+    fn to_flags(&self) -> i32 {
+        self.kind.to_flags()
+            | self.access.to_flags()
+            | if self.delete_on_close {
+                ffi::SQLITE_OPEN_DELETEONCLOSE
+            } else {
+                0
+            }
+    }
 }
 
 impl OpenKind {
@@ -1096,6 +1129,19 @@ impl OpenKind {
             flags if flags & ffi::SQLITE_OPEN_SUPER_JOURNAL > 0 => Some(Self::SuperJournal),
             flags if flags & ffi::SQLITE_OPEN_WAL > 0 => Some(Self::Wal),
             _ => None,
+        }
+    }
+
+    fn to_flags(self) -> i32 {
+        match self {
+            OpenKind::MainDb => ffi::SQLITE_OPEN_MAIN_DB,
+            OpenKind::MainJournal => ffi::SQLITE_OPEN_MAIN_JOURNAL,
+            OpenKind::TempDb => ffi::SQLITE_OPEN_TEMP_DB,
+            OpenKind::TempJournal => ffi::SQLITE_OPEN_TEMP_JOURNAL,
+            OpenKind::TransientDb => ffi::SQLITE_OPEN_TRANSIENT_DB,
+            OpenKind::SubJournal => ffi::SQLITE_OPEN_SUBJOURNAL,
+            OpenKind::SuperJournal => ffi::SQLITE_OPEN_SUPER_JOURNAL,
+            OpenKind::Wal => ffi::SQLITE_OPEN_WAL,
         }
     }
 }
@@ -1113,6 +1159,17 @@ impl OpenAccess {
             flags if flags & ffi::SQLITE_OPEN_READWRITE > 0 => Some(Self::Write),
             flags if flags & ffi::SQLITE_OPEN_READONLY > 0 => Some(Self::Read),
             _ => None,
+        }
+    }
+
+    fn to_flags(self) -> i32 {
+        match self {
+            OpenAccess::Read => ffi::SQLITE_OPEN_READONLY,
+            OpenAccess::Write => ffi::SQLITE_OPEN_READWRITE,
+            OpenAccess::Create => ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE,
+            OpenAccess::CreateNew => {
+                ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_EXCLUSIVE
+            }
         }
     }
 }
