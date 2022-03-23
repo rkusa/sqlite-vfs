@@ -7,7 +7,6 @@ use std::ffi::{c_void, CStr, CString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::os::raw::{c_char, c_int};
-use std::path::Path;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::slice;
@@ -29,8 +28,8 @@ pub trait File: Read + Seek + Write {
 /// This example uses [std::fs] to to persist the database to disk.
 /// ```
 /// # use std::fs;
-/// # use std::path::Path;
-/// #
+/// # use std::path::{Path, PathBuf};
+/// # use std::str::FromStr;
 /// # use sqlite_vfs::{OpenAccess, OpenOptions, Vfs};
 /// #
 /// struct FsVfs;
@@ -38,7 +37,7 @@ pub trait File: Read + Seek + Write {
 /// impl Vfs for FsVfs {
 ///     type File = fs::File;
 ///
-///     fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
+///     fn open(&self, path: &str, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
 ///         let mut o = fs::OpenOptions::new();
 ///         o.read(true).write(opts.access != OpenAccess::Read);
 ///         match opts.access {
@@ -54,11 +53,12 @@ pub trait File: Read + Seek + Write {
 ///         Ok(f)
 ///     }
 ///
-///     fn delete(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+///     fn delete(&self, path: &str) -> Result<(), std::io::Error> {
 ///         std::fs::remove_file(path)
 ///     }
 ///
-///     fn exists(&self, path: &Path) -> Result<bool, std::io::Error> {
+///     fn exists(&self, path: &str) -> Result<bool, std::io::Error> {
+///         let path = PathBuf::from_str(path).unwrap();
 ///         Ok(path.is_file())
 ///     }
 /// }
@@ -68,16 +68,16 @@ pub trait Vfs {
     type File: File;
 
     /// Open the database object (of type `opts.kind`) at `path`.
-    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error>;
+    fn open(&self, path: &str, opts: OpenOptions) -> Result<Self::File, std::io::Error>;
 
     /// Delete the database object at `path`.
-    fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
+    fn delete(&self, path: &str) -> Result<(), std::io::Error>;
 
     /// Check if and object at `path` already exists.
-    fn exists(&self, path: &Path) -> Result<bool, std::io::Error>;
+    fn exists(&self, path: &str) -> Result<bool, std::io::Error>;
 
     /// Check access to `path`. The default implementation always returns `true`.
-    fn access(&self, _path: &Path, _write: bool) -> Result<bool, std::io::Error> {
+    fn access(&self, _path: &str, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
     }
 }

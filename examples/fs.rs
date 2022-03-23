@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::Path;
+use std::{fs, path::PathBuf, str::FromStr};
 
 use rusqlite::{Connection, OpenFlags};
 use sqlite_vfs::{register, OpenAccess, OpenOptions, Vfs};
@@ -9,7 +8,7 @@ struct FsVfs;
 impl Vfs for FsVfs {
     type File = fs::File;
 
-    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
+    fn open(&self, path: &str, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
         match opts.access {
@@ -25,11 +24,12 @@ impl Vfs for FsVfs {
         Ok(f)
     }
 
-    fn delete(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+    fn delete(&self, path: &str) -> Result<(), std::io::Error> {
         std::fs::remove_file(path)
     }
 
-    fn exists(&self, path: &Path) -> Result<bool, std::io::Error> {
+    fn exists(&self, path: &str) -> Result<bool, std::io::Error> {
+        let path = PathBuf::from_str(path).unwrap();
         Ok(path.is_file())
     }
 }
