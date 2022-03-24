@@ -24,6 +24,8 @@ pub use ffi::{SQLITE_IOERR, SQLITE_OK};
 /// A file opened by [Vfs].
 ///
 /// See https://sqlite.org/c3ref/io_methods.html
+///
+/// Close () will result in a call to drop
 pub trait File {
     /// int (*xFileSize)(sqlite3_file*, sqlite3_int64 *pSize);
     fn file_size(&self) -> VfsResult<u64>;
@@ -79,22 +81,22 @@ pub trait Vfs {
     /// Open the database object (of type `opts.kind`) at `path`.
     ///
     /// int (*xOpen)(sqlite3_vfs*, const char *zName, sqlite3_file*, int flags, int *pOutFlags);
-    fn open(&self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File>;
+    fn open(&mut self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File>;
 
     /// Delete the database object at `path`.
     ///
     /// int (*xDelete)(sqlite3_vfs*, const char *zName, int syncDir);
-    fn delete(&self, path: &CStr) -> VfsResult<()>;
+    fn delete(&mut self, path: &CStr) -> VfsResult<()>;
 
     /// Check if an object at `path` already exists. This is called from xAccess.
     ///
     /// int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
-    fn exists(&self, path: &CStr) -> VfsResult<bool>;
+    fn exists(&mut self, path: &CStr) -> VfsResult<bool>;
 
     /// Check access to `path`. The default implementation always returns `true`.
     ///
     /// int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
-    fn access(&self, path: &CStr, write: bool) -> VfsResult<bool> {
+    fn access(&mut self, path: &CStr, write: bool) -> VfsResult<bool> {
         Ok(true)
     }
 
@@ -751,7 +753,9 @@ mod io {
     }
 
     /// Return the device characteristic flags supported by a file.
-    pub unsafe extern "C" fn device_characteristics<F: File>(p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn device_characteristics<F: File>(
+        p_file: *mut ffi::sqlite3_file,
+    ) -> c_int {
         log::trace!("device_characteristics");
 
         let state = match file_state::<F>(p_file, true) {

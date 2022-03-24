@@ -1,18 +1,25 @@
-use std::{collections::BTreeMap, ffi::CStr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ffi::{CStr, CString},
+};
 
 use log::info;
-use parking_lot::Mutex;
-use sqlite_vfs::{OpenOptions, Vfs, VfsResult, SQLITE_IOERR};
+use sqlite_vfs::{OpenKind, OpenOptions, Vfs, VfsResult, SQLITE_IOERR};
 
-#[derive(Debug)]
 struct MemVfs {
-    files: Arc<parking_lot::Mutex<BTreeMap<String, MemFile>>>,
+    files: BTreeMap<String, bool>,
+}
+
+impl std::fmt::Debug for MemVfs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemVfs").finish()
+    }
 }
 
 impl MemVfs {
     fn new() -> Self {
         Self {
-            files: Arc::new(Mutex::new(Default::default())),
+            files: Default::default(),
         }
     }
 }
@@ -23,13 +30,15 @@ struct MemFile {
     data: Vec<u8>,
 }
 
+impl Drop for MemFile {
+    fn drop(&mut self) {
+        info!("drop {:?}", self);
+    }
+}
+
 impl std::fmt::Debug for MemFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemFile")
-            .field("name", &self.name)
-            .field("data", &self.data.len())
-            .field("kind", &self.opts.kind)
-            .finish()
+        write!(f, "{:?}({})", self.opts.kind, self.name)
     }
 }
 
@@ -61,6 +70,9 @@ impl sqlite_vfs::File for MemFile {
 
     fn sync(&mut self) -> VfsResult<()> {
         info!("sync {:?}", self);
+        // if self.opts.kind == OpenKind::MainDb {
+        //     return Err(SQLITE_IOERR)
+        // }
         Ok(())
     }
 
@@ -77,16 +89,17 @@ impl sqlite_vfs::File for MemFile {
     }
 
     fn sector_size(&self) -> usize {
-        1024 * 1024
+        1024
     }
 }
 
 impl Vfs for MemVfs {
     type File = MemFile;
 
-    fn open(&self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File> {
+    fn open(&mut self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File> {
         let path = path.to_string_lossy();
         info!("open {:?} {} {:?}", self, path, opts);
+        self.files.insert(path.to_string(), true);
         Ok(MemFile {
             name: path.into(),
             opts,
@@ -94,20 +107,24 @@ impl Vfs for MemVfs {
         })
     }
 
-    fn delete(&self, path: &CStr) -> VfsResult<()> {
+    fn delete(&mut self, path: &CStr) -> VfsResult<()> {
         let path = path.to_string_lossy();
+        let t: &str = &path;
+        self.files.remove(t);
         info!("delete {:?} {}", self, path);
         Ok(())
     }
 
-    fn exists(&self, path: &CStr) -> VfsResult<bool> {
+    fn exists(&mut self, path: &CStr) -> VfsResult<bool> {
         let path = path.to_string_lossy();
+        let t: &str = &path;
+        let res = self.files.contains_key(t);
         info!("exists {:?} {}", self, path);
-        Ok(false)
+        Ok(res)
     }
 
     /// Check access to `path`. The default implementation always returns `true`.
-    fn access(&self, path: &CStr, write: bool) -> VfsResult<bool> {
+    fn access(&mut self, path: &CStr, write: bool) -> VfsResult<bool> {
         let path = path.to_string_lossy();
         info!("access {} {}", path, write);
         Ok(true)
@@ -131,7 +148,8 @@ fn main() -> anyhow::Result<()> {
     conn.execute_batch(
         r#"
         PRAGMA page_size=32768;
-        PRAGMA journal_mode = MEMORY;
+        PRAGMA journal_mode = TRUNCATE;
+        --! PRAGMA journal_mode = MEMORY;
         "#,
     )?;
 
