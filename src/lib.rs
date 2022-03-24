@@ -27,14 +27,46 @@ pub use ffi::{SQLITE_IOERR, SQLITE_OK};
 pub trait File {
     /// int (*xFileSize)(sqlite3_file*, sqlite3_int64 *pSize);
     fn file_size(&self) -> VfsResult<u64>;
+
     /// int (*xTruncate)(sqlite3_file*, sqlite3_int64 size);
     fn truncate(&mut self, size: u64) -> VfsResult<()>;
+
     /// int (*xWrite)(sqlite3_file*, const void*, int iAmt, sqlite3_int64 iOfst);
     fn write(&mut self, pos: u64, buf: &[u8]) -> VfsResult<usize>;
+
     /// int (*xRead)(sqlite3_file*, void*, int iAmt, sqlite3_int64 iOfst);
     fn read(&mut self, pos: u64, buf: &mut [u8]) -> VfsResult<usize>;
+
     /// int (*xSync)(sqlite3_file*, int flags);
     fn sync(&mut self) -> VfsResult<()>;
+
+    /// The xSectorSize() method returns the sector size of the device that underlies the file.
+    /// The sector size is the minimum write that can be performed without disturbing other bytes in the file.
+    ///
+    /// int (*xSectorSize)(sqlite3_file*);
+    fn sector_size(&self) -> usize {
+        1024
+    }
+
+    /// The xDeviceCharacteristics() method returns a bit vector describing behaviors of the underlying device:
+    ///
+    /// int (*xDeviceCharacteristics)(sqlite3_file*);
+    fn device_characteristics(&self) -> i32 {
+        // For now, simply copied from [memfs] without putting in a lot of thought.
+        // [memfs]: (https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c#L271-L276)
+
+        // writes of any size are atomic
+        ffi::SQLITE_IOCAP_ATOMIC |
+        // after reboot following a crash or power loss, the only bytes in a file that were written
+        // at the application level might have changed and that adjacent bytes, even bytes within
+        // the same sector are guaranteed to be unchanged
+        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE |
+        // when data is appended to a file, the data is appended first then the size of the file is
+        // extended, never the other way around
+        ffi::SQLITE_IOCAP_SAFE_APPEND |
+        // information is written to disk in the same order as calls to xWrite()
+        ffi::SQLITE_IOCAP_SEQUENTIAL
+    }
 }
 
 /// A sqlite vfs
@@ -707,40 +739,26 @@ mod io {
     }
 
     /// Return the sector-size in bytes for a file.
-    pub unsafe extern "C" fn sector_size<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn sector_size<F: File>(p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("sector_size");
 
-        // reset last error
-        if file_state::<F>(p_file, true).is_err() {
-            return ffi::SQLITE_ERROR;
-        }
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
 
-        1024
+        state.file.sector_size() as c_int
     }
 
     /// Return the device characteristic flags supported by a file.
-    pub unsafe extern "C" fn device_characteristics<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn device_characteristics<F: File>(p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("device_characteristics");
 
-        // reset last error
-        if file_state::<F>(p_file, true).is_err() {
-            return ffi::SQLITE_ERROR;
-        }
-
-        // For now, simply copied from [memfs] without putting in a lot of thought.
-        // [memfs]: (https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c#L271-L276)
-
-        // writes of any size are atomic
-        ffi::SQLITE_IOCAP_ATOMIC |
-        // after reboot following a crash or power loss, the only bytes in a file that were written
-        // at the application level might have changed and that adjacent bytes, even bytes within
-        // the same sector are guaranteed to be unchanged
-        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE |
-        // when data is appended to a file, the data is appended first then the size of the file is
-        // extended, never the other way around
-        ffi::SQLITE_IOCAP_SAFE_APPEND |
-        // information is written to disk in the same order as calls to xWrite()
-        ffi::SQLITE_IOCAP_SEQUENTIAL
+        let state = match file_state::<F>(p_file, true) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+        state.file.device_characteristics() as c_int
     }
 
     /// Create a shared memory file mapping.
