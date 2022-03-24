@@ -33,7 +33,7 @@ impl std::fmt::Debug for MemFile {
 
 impl sqlite_vfs::File for MemFile {
     fn read(&mut self, start: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        info!("read_exact {:?} {}", self, buf.len());
+        info!("read {:?} {} {}", self, start, buf.len());
         let start = usize::try_from(start).unwrap();
         let remaining = self.data.len().saturating_sub(start);
         let n = remaining.min(buf.len());
@@ -44,7 +44,7 @@ impl sqlite_vfs::File for MemFile {
     }
 
     fn write(&mut self, start: u64, buf: &[u8]) -> VfsResult<usize> {
-        info!("write_all {:?} {}", self, buf.len());
+        info!("write {:?} {} {}", self, start, buf.len());
         let start = usize::try_from(start).unwrap();
         if start > self.data.len() {
             return Err(SQLITE_IOERR);
@@ -58,7 +58,7 @@ impl sqlite_vfs::File for MemFile {
     }
 
     fn sync(&mut self) -> VfsResult<()> {
-        info!("flush {:?}", self);
+        info!("sync {:?}", self);
         Ok(())
     }
 
@@ -72,6 +72,10 @@ impl sqlite_vfs::File for MemFile {
         let size = usize::try_from(size).unwrap();
         self.data.truncate(size);
         Ok(())
+    }
+
+    fn sector_size(&self) -> usize {
+        1024 * 1024
     }
 }
 
