@@ -19,6 +19,7 @@ impl MemVfs {
 
 struct MemFile {
     name: String,
+    opts: OpenOptions,
     data: Vec<u8>,
 }
 
@@ -27,6 +28,7 @@ impl std::fmt::Debug for MemFile {
         f.debug_struct("MemFile")
             .field("name", &self.name)
             .field("data", &self.data.len())
+            .field("kind", &self.opts.kind)
             .finish()
     }
 }
@@ -87,6 +89,7 @@ impl Vfs for MemVfs {
         info!("open {:?} {} {:?}", self, path, opts);
         Ok(MemFile {
             name: path.into(),
+            opts,
             data: Default::default(),
         })
     }
@@ -123,6 +126,13 @@ fn main() -> anyhow::Result<()> {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         "test",
+    )?;
+
+    conn.execute_batch(
+        r#"
+        PRAGMA page_size=32768;
+        PRAGMA journal_mode = MEMORY;
+        "#,
     )?;
 
     // uses shm, so not going to work in wasm
