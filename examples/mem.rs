@@ -1,12 +1,8 @@
-use std::{
-    collections::BTreeMap,
-    io::{self, Read, Seek, Write},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ffi::CStr, sync::Arc};
 
 use log::info;
 use parking_lot::Mutex;
-use sqlite_vfs::{register, OpenAccess, OpenOptions, Vfs};
+use sqlite_vfs::{register, OpenAccess, OpenOptions, Vfs, VfsResult, SQLITE_IOERR, SQLITE_OK};
 
 #[derive(Debug)]
 struct MemVfs {
@@ -24,7 +20,6 @@ impl MemVfs {
 struct MemFile {
     name: String,
     data: Vec<u8>,
-    position: usize,
 }
 
 impl std::fmt::Debug for MemFile {
@@ -32,54 +27,47 @@ impl std::fmt::Debug for MemFile {
         f.debug_struct("MemFile")
             .field("name", &self.name)
             .field("data", &self.data.len())
-            .field("position", &self.position)
             .finish()
     }
 }
 
 impl sqlite_vfs::File for MemFile {
-    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_exact(&mut self, start: u64, buf: &mut [u8]) -> VfsResult<usize> {
         info!("read_exact {:?} {}", self, buf.len());
-        let remaining = self.data.len().saturating_sub(self.position);
+        let start = usize::try_from(start).unwrap();
+        let remaining = self.data.len().saturating_sub(start);
         let n = remaining.min(buf.len());
         if n != 0 {
-            buf[..n].copy_from_slice(&self.data[self.position..self.position + n]);
-            self.position += n;
+            buf[..n].copy_from_slice(&self.data[start..start + n]);
         }
         Ok(n)
     }
 
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write_all(&mut self, start: u64, buf: &[u8]) -> VfsResult<usize> {
         info!("write_all {:?} {}", self, buf.len());
-        if self.position > self.data.len() {
-            return Err(io::Error::new(io::ErrorKind::Other, ""));
+        let start = usize::try_from(start).unwrap();
+        if start > self.data.len() {
+            return Err(SQLITE_IOERR);
         }
         let current_len = self.data.len();
         let len = buf.len();
-        let end = self.position + buf.len();
+        let end = start + buf.len();
         self.data.extend((current_len..end).map(|_| 0u8));
-        self.data[self.position..end].copy_from_slice(&buf);
-        self.position = end;
+        self.data[start..end].copy_from_slice(&buf);
         Ok(len)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> VfsResult<()> {
         info!("flush {:?}", self);
         Ok(())
     }
 
-    fn seek_from_start(&mut self, pos: u64) -> std::io::Result<u64> {
-        info!("seek_from_start {:?} {:?}", self, pos);
-        self.position = usize::try_from(pos).unwrap();
-        Ok(self.position as u64)
-    }
-
-    fn file_size(&self) -> Result<u64, std::io::Error> {
+    fn file_size(&self) -> VfsResult<u64> {
         info!("file_size {:?}", self);
         Ok(self.data.len() as u64)
     }
 
-    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
+    fn truncate(&mut self, size: u64) -> VfsResult<()> {
         info!("truncate {:?} {}", self, size);
         let size = usize::try_from(size).unwrap();
         self.data.truncate(size);
@@ -90,27 +78,30 @@ impl sqlite_vfs::File for MemFile {
 impl Vfs for MemVfs {
     type File = MemFile;
 
-    fn open(&self, path: &str, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
+    fn open(&self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File> {
+        let path = path.to_string_lossy();
         info!("open {:?} {} {:?}", self, path, opts);
         Ok(MemFile {
             name: path.into(),
             data: Default::default(),
-            position: 0,
         })
     }
 
-    fn delete(&self, path: &str) -> Result<(), std::io::Error> {
+    fn delete(&self, path: &CStr) -> VfsResult<()> {
+        let path = path.to_string_lossy();
         info!("delete {:?} {}", self, path);
         Ok(())
     }
 
-    fn exists(&self, path: &str) -> Result<bool, std::io::Error> {
+    fn exists(&self, path: &CStr) -> VfsResult<bool> {
+        let path = path.to_string_lossy();
         info!("exists {:?} {}", self, path);
         Ok(false)
     }
 
     /// Check access to `path`. The default implementation always returns `true`.
-    fn access(&self, path: &str, write: bool) -> Result<bool, std::io::Error> {
+    fn access(&self, path: &CStr, write: bool) -> VfsResult<bool> {
+        let path = path.to_string_lossy();
         info!("access {} {}", path, write);
         Ok(true)
     }
