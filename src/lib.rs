@@ -22,30 +22,82 @@ pub type VfsResult<T> = std::result::Result<T, VfsError>;
 pub use ffi::{SQLITE_IOERR, SQLITE_OK};
 
 /// A file opened by [Vfs].
+///
+/// See https://sqlite.org/c3ref/io_methods.html
 pub trait File {
+    /// int (*xFileSize)(sqlite3_file*, sqlite3_int64 *pSize);
     fn file_size(&self) -> VfsResult<u64>;
+    /// int (*xTruncate)(sqlite3_file*, sqlite3_int64 size);
     fn truncate(&mut self, size: u64) -> VfsResult<()>;
-    fn flush(&mut self) -> VfsResult<()>;
-    fn write_all(&mut self, pos: u64, buf: &[u8]) -> VfsResult<usize>;
-    fn read_exact(&mut self, pos: u64, buf: &mut [u8]) -> VfsResult<usize>;
+    /// int (*xWrite)(sqlite3_file*, const void*, int iAmt, sqlite3_int64 iOfst);
+    fn write(&mut self, pos: u64, buf: &[u8]) -> VfsResult<usize>;
+    /// int (*xRead)(sqlite3_file*, void*, int iAmt, sqlite3_int64 iOfst);
+    fn read(&mut self, pos: u64, buf: &mut [u8]) -> VfsResult<usize>;
+    /// int (*xSync)(sqlite3_file*, int flags);
+    fn sync(&mut self) -> VfsResult<()>;
 }
 
+/// A sqlite vfs
+///
+/// See https://sqlite.org/c3ref/vfs.html
 pub trait Vfs {
     /// The file returned by [Vfs::open].
     type File: File;
 
     /// Open the database object (of type `opts.kind`) at `path`.
+    ///
+    /// int (*xOpen)(sqlite3_vfs*, const char *zName, sqlite3_file*, int flags, int *pOutFlags);
     fn open(&self, path: &CStr, opts: OpenOptions) -> VfsResult<Self::File>;
 
     /// Delete the database object at `path`.
+    ///
+    /// int (*xDelete)(sqlite3_vfs*, const char *zName, int syncDir);
     fn delete(&self, path: &CStr) -> VfsResult<()>;
 
-    /// Check if and object at `path` already exists.
+    /// Check if an object at `path` already exists. This is called from xAccess.
+    ///
+    /// int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
     fn exists(&self, path: &CStr) -> VfsResult<bool>;
 
     /// Check access to `path`. The default implementation always returns `true`.
+    ///
+    /// int (*xAccess)(sqlite3_vfs*, const char *zName, int flags, int *pResOut);
     fn access(&self, path: &CStr, write: bool) -> VfsResult<bool> {
         Ok(true)
+    }
+
+    /// Generate up to bytes.len() bytes of randomness
+    ///
+    /// int (*xRandomness)(sqlite3_vfs*, int nByte, char *zOut);
+    fn randomness(&self, bytes: &mut [i8]) -> usize {
+        use rand::Rng;
+        rand::thread_rng().fill(bytes);
+        bytes.len()
+    }
+
+    /// The xSleep() method causes the calling thread to sleep for at least the number of microseconds given.
+    ///
+    /// return the number of microseconds that were actually slept
+    ///
+    /// int (*xSleep)(sqlite3_vfs*, int microseconds);
+    fn sleep(&self, n_micro: usize) -> usize {
+        let instant = Instant::now();
+        thread::sleep(Duration::from_micros(n_micro as u64));
+        instant.elapsed().as_micros() as usize
+    }
+
+    /// The xCurrentTime() method returns a Julian Day Number for the current date and time as a floating point value.
+    ///
+    /// int (*xCurrentTime)(sqlite3_vfs*, double*);
+    fn current_time(&self) -> f64 {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+        2440587.5 + now / 864.0e5
+    }
+
+    /// int (*xCurrentTimeInt64)(sqlite3_vfs*, sqlite3_int64*);
+    fn current_time_int64(&self) -> i64 {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
+        ((2440587.5 + now / 864.0e5) * 864.0e5) as i64
     }
 }
 
@@ -140,8 +192,8 @@ pub fn register<F: File, V: Vfs<File = F>>(name: &str, vfs: V) -> Result<(), Reg
         xDlError: Some(vfs::dlerror),
         xDlSym: Some(vfs::dlsym),
         xDlClose: Some(vfs::dlclose),
-        xRandomness: Some(vfs::randomness),
-        xSleep: Some(vfs::sleep),
+        xRandomness: Some(vfs::randomness::<V>),
+        xSleep: Some(vfs::sleep::<V>),
         xCurrentTime: Some(vfs::current_time::<V>),
         xGetLastError: Some(vfs::get_last_error::<V>),
         xCurrentTimeInt64: Some(vfs::current_time_int64::<V>),
@@ -368,31 +420,40 @@ mod vfs {
     }
 
     /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
-    pub unsafe extern "C" fn randomness(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+    pub unsafe extern "C" fn randomness<V: Vfs>(
+        p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
         z_buf_out: *mut c_char,
     ) -> c_int {
         log::trace!("randomness");
 
-        use rand::Rng;
-
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_DELETE,
+        };
+        state.last_error.take();
         let bytes = slice::from_raw_parts_mut(z_buf_out, n_byte as usize);
-        rand::thread_rng().fill(bytes);
-        bytes.len() as c_int
+
+        let len = state.vfs.randomness(bytes);
+        len as c_int
     }
 
     /// Sleep for `n_micro` microseconds. Return the number of microseconds actually slept.
-    pub unsafe extern "C" fn sleep(_p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
+    pub unsafe extern "C" fn sleep<V: Vfs>(p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
         log::trace!("sleep");
 
-        let instant = Instant::now();
-        thread::sleep(Duration::from_micros(n_micro as u64));
-        instant.elapsed().as_micros() as c_int
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_DELETE,
+        };
+        state.last_error.take();
+
+        let elapsed_us: usize = state.vfs.sleep(n_micro as usize);
+        elapsed_us as c_int
     }
 
     /// Return the current time as a Julian Day number in `p_time_out`.
-    pub unsafe extern "C" fn current_time<V>(
+    pub unsafe extern "C" fn current_time<V: Vfs>(
         p_vfs: *mut ffi::sqlite3_vfs,
         p_time_out: *mut f64,
     ) -> c_int {
@@ -404,8 +465,7 @@ mod vfs {
         };
         state.last_error.take();
 
-        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        *p_time_out = 2440587.5 + now / 864.0e5;
+        *p_time_out = state.vfs.current_time();
         ffi::SQLITE_OK
     }
 
@@ -434,7 +494,7 @@ mod vfs {
         ffi::SQLITE_OK
     }
 
-    pub unsafe extern "C" fn current_time_int64<V>(
+    pub unsafe extern "C" fn current_time_int64<V: Vfs>(
         p_vfs: *mut ffi::sqlite3_vfs,
         p: *mut i64,
     ) -> i32 {
@@ -446,8 +506,7 @@ mod vfs {
         };
         state.last_error.take();
 
-        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        *p = ((2440587.5 + now / 864.0e5) * 864.0e5) as i64;
+        *p = state.vfs.current_time_int64();
         ffi::SQLITE_OK
     }
 }
@@ -485,7 +544,7 @@ mod io {
         };
 
         let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-        if let Err(err) = state.file.read_exact(i_ofst as u64, out) {
+        if let Err(err) = state.file.read(i_ofst as u64, out) {
             return err;
         }
 
@@ -507,7 +566,7 @@ mod io {
         };
 
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
-        if let Err(err) = state.file.write_all(i_ofst as u64, data) {
+        if let Err(err) = state.file.write(i_ofst as u64, data) {
             state.set_last_error(err);
             return ffi::SQLITE_IOERR_WRITE;
         }
@@ -546,7 +605,7 @@ mod io {
         };
         log::trace!("sync ({})", state.name);
 
-        if let Err(err) = state.file.flush() {
+        if let Err(err) = state.file.sync() {
             state.set_last_error(err);
             return ffi::SQLITE_IOERR_FSYNC;
         }

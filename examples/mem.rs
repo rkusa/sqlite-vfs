@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, ffi::CStr, sync::Arc};
 
 use log::info;
 use parking_lot::Mutex;
-use sqlite_vfs::{register, OpenAccess, OpenOptions, Vfs, VfsResult, SQLITE_IOERR, SQLITE_OK};
+use sqlite_vfs::{OpenOptions, Vfs, VfsResult, SQLITE_IOERR};
 
 #[derive(Debug)]
 struct MemVfs {
@@ -32,7 +32,7 @@ impl std::fmt::Debug for MemFile {
 }
 
 impl sqlite_vfs::File for MemFile {
-    fn read_exact(&mut self, start: u64, buf: &mut [u8]) -> VfsResult<usize> {
+    fn read(&mut self, start: u64, buf: &mut [u8]) -> VfsResult<usize> {
         info!("read_exact {:?} {}", self, buf.len());
         let start = usize::try_from(start).unwrap();
         let remaining = self.data.len().saturating_sub(start);
@@ -43,7 +43,7 @@ impl sqlite_vfs::File for MemFile {
         Ok(n)
     }
 
-    fn write_all(&mut self, start: u64, buf: &[u8]) -> VfsResult<usize> {
+    fn write(&mut self, start: u64, buf: &[u8]) -> VfsResult<usize> {
         info!("write_all {:?} {}", self, buf.len());
         let start = usize::try_from(start).unwrap();
         if start > self.data.len() {
@@ -57,7 +57,7 @@ impl sqlite_vfs::File for MemFile {
         Ok(len)
     }
 
-    fn flush(&mut self) -> VfsResult<()> {
+    fn sync(&mut self) -> VfsResult<()> {
         info!("flush {:?}", self);
         Ok(())
     }
@@ -120,6 +120,9 @@ fn main() -> anyhow::Result<()> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         "test",
     )?;
+
+    // uses shm, so not going to work in wasm
+    // conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS vals (id INT PRIMARY KEY, val VARCHAR NOT NULL)",
