@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, SeekFrom};
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::os::raw::{c_char, c_int};
 use std::ptr::null_mut;
@@ -17,52 +17,15 @@ use std::time::Instant;
 use libsqlite3_sys as ffi;
 
 /// A file opened by [Vfs].
-pub trait File: Read + Seek + Write {
+pub trait File {
     fn file_size(&self) -> Result<u64, std::io::Error>;
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<usize>;
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn seek_from_start(&mut self, from: u64) -> std::io::Result<u64>;
 }
 
-/// A virtual file system for SQLite.
-///
-/// # Example
-/// This example uses [std::fs] to to persist the database to disk.
-/// ```
-/// # use std::fs;
-/// # use std::path::{Path, PathBuf};
-/// # use std::str::FromStr;
-/// # use sqlite_vfs::{OpenAccess, OpenOptions, Vfs};
-/// #
-/// struct FsVfs;
-///
-/// impl Vfs for FsVfs {
-///     type File = fs::File;
-///
-///     fn open(&self, path: &str, opts: OpenOptions) -> Result<Self::File, std::io::Error> {
-///         let mut o = fs::OpenOptions::new();
-///         o.read(true).write(opts.access != OpenAccess::Read);
-///         match opts.access {
-///             OpenAccess::Create => {
-///                 o.create(true);
-///             }
-///             OpenAccess::CreateNew => {
-///                 o.create_new(true);
-///             }
-///             _ => {}
-///         }
-///         let f = o.open(path)?;
-///         Ok(f)
-///     }
-///
-///     fn delete(&self, path: &str) -> Result<(), std::io::Error> {
-///         std::fs::remove_file(path)
-///     }
-///
-///     fn exists(&self, path: &str) -> Result<bool, std::io::Error> {
-///         let path = PathBuf::from_str(path).unwrap();
-///         Ok(path.is_file())
-///     }
-/// }
-/// ```
 pub trait Vfs {
     /// The file returned by [Vfs::open].
     type File: File;
@@ -534,7 +497,7 @@ mod io {
         };
         log::trace!("read ({})", state.name);
 
-        match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
+        match state.file.seek_from_start(i_ofst as u64) {
             Ok(o) => {
                 if o != i_ofst as u64 {
                     return ffi::SQLITE_IOERR_READ;
@@ -575,7 +538,7 @@ mod io {
         };
         log::trace!("write ({})", state.name);
 
-        match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
+        match state.file.seek_from_start(i_ofst as u64) {
             Ok(o) => {
                 if o != i_ofst as u64 {
                     return ffi::SQLITE_IOERR_WRITE;
@@ -888,16 +851,6 @@ unsafe fn file_state<'a, F>(
         ext.unset_last_error();
     }
     Ok(ext)
-}
-
-impl File for std::fs::File {
-    fn file_size(&self) -> Result<u64, std::io::Error> {
-        Ok(self.metadata()?.len())
-    }
-
-    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
-        self.set_len(size)
-    }
 }
 
 impl OpenOptions {

@@ -37,9 +37,9 @@ impl std::fmt::Debug for MemFile {
     }
 }
 
-impl Read for MemFile {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        info!("read {:?} {}", self, buf.len());
+impl sqlite_vfs::File for MemFile {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        info!("read_exact {:?} {}", self, buf.len());
         let remaining = self.data.len().saturating_sub(self.position);
         let n = remaining.min(buf.len());
         if n != 0 {
@@ -48,11 +48,9 @@ impl Read for MemFile {
         }
         Ok(n)
     }
-}
 
-impl Write for MemFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        info!("write {:?} {}", self, buf.len());
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        info!("write_all {:?} {}", self, buf.len());
         if self.position > self.data.len() {
             return Err(io::Error::new(io::ErrorKind::Other, ""));
         }
@@ -69,39 +67,13 @@ impl Write for MemFile {
         info!("flush {:?}", self);
         Ok(())
     }
-}
 
-impl Seek for MemFile {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        info!("seek {:?} {:?}", self, pos);
-        match pos {
-            io::SeekFrom::Start(x) => {
-                self.position = usize::try_from(x).unwrap();
-                Ok(self.position as u64)
-            }
-            io::SeekFrom::End(x) => {
-                let p = (self.data.len() as i64).saturating_add(x);
-                if p < 0 {
-                    Err(io::Error::new(io::ErrorKind::Other, ""))
-                } else {
-                    self.position = usize::try_from(p).unwrap();
-                    Ok(self.position as u64)
-                }
-            }
-            io::SeekFrom::Current(x) => {
-                let p = (self.position as i64).saturating_add(x);
-                if p < 0 {
-                    Err(io::Error::new(io::ErrorKind::Other, ""))
-                } else {
-                    self.position = usize::try_from(p).unwrap();
-                    Ok(self.position as u64)
-                }
-            }
-        }
+    fn seek_from_start(&mut self, pos: u64) -> std::io::Result<u64> {
+        info!("seek_from_start {:?} {:?}", self, pos);
+        self.position = usize::try_from(pos).unwrap();
+        Ok(self.position as u64)
     }
-}
 
-impl sqlite_vfs::File for MemFile {
     fn file_size(&self) -> Result<u64, std::io::Error> {
         info!("file_size {:?}", self);
         Ok(self.data.len() as u64)
