@@ -4,6 +4,8 @@
 extern "C" {
     pub fn sqlite3_inc_sync_count();
     pub fn sqlite3_inc_fullsync_count();
+    pub fn sqlite3_set_current_time(current_time: i32);
+    pub fn sqlite3_get_current_time() -> i32;
 }
 
 // Excerpt of

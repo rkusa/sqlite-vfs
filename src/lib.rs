@@ -502,13 +502,34 @@ mod vfs {
 
     /// Return the current time as a Julian Day number in `p_time_out`.
     pub unsafe extern "C" fn current_time<V>(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+        p_vfs: *mut ffi::sqlite3_vfs,
         p_time_out: *mut f64,
     ) -> c_int {
         log::trace!("current_time");
 
-        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        *p_time_out = 2440587.5 + now / 864.0e5;
+        let mut i = 0i64;
+        current_time_int64::<V>(p_vfs, &mut i);
+
+        *p_time_out = i as f64 / 86400000.0;
+        ffi::SQLITE_OK
+    }
+
+    pub unsafe extern "C" fn current_time_int64<V>(
+        _p_vfs: *mut ffi::sqlite3_vfs,
+        p: *mut i64,
+    ) -> i32 {
+        log::trace!("current_time_int64");
+
+        const UNIX_EPOCH: i64 = 24405875 * 8640000;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() + UNIX_EPOCH;
+        #[cfg(feature = "sqlite_test")]
+        let now = if ffi::sqlite3_get_current_time() > 0 {
+            ffi::sqlite3_get_current_time() as i64 * 1000 + UNIX_EPOCH
+        } else {
+            now
+        };
+
+        *p = now;
         ffi::SQLITE_OK
     }
 
@@ -534,17 +555,6 @@ mod vfs {
             let out = slice::from_raw_parts_mut(z_err_msg as *mut u8, msg.len());
             out.copy_from_slice(msg);
         }
-        ffi::SQLITE_OK
-    }
-
-    pub unsafe extern "C" fn current_time_int64<V>(
-        _p_vfs: *mut ffi::sqlite3_vfs,
-        p: *mut i64,
-    ) -> i32 {
-        log::trace!("current_time_int64");
-
-        let now = time::OffsetDateTime::now_utc().unix_timestamp() as f64;
-        *p = ((2440587.5 + now / 864.0e5) * 864.0e5) as i64;
         ffi::SQLITE_OK
     }
 }
@@ -594,7 +604,7 @@ mod io {
         match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
             Ok(o) => {
                 if o != i_ofst as u64 {
-                    return ffi::SQLITE_IOERR_READ;
+                    return ffi::SQLITE_IOERR_CORRUPTFS;
                 }
             }
             Err(err) => {
