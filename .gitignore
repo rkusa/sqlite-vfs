@@ -2,7 +2,7 @@
 !.gitignore
 !.github
 !.dockerignore
-/target
+target
 wasm-pack.log
 build/
 /db

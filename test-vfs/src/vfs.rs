@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs};
@@ -12,6 +13,7 @@ use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs};
 #[derive(Default)]
 pub struct FsVfs {
     state: HashMap<PathBuf, Weak<Mutex<FileState>>>,
+    temp_counter: AtomicUsize,
 }
 
 pub struct FileHandle {
@@ -76,6 +78,14 @@ impl Vfs for FsVfs {
 
     fn exists(&self, path: &Path) -> Result<bool, std::io::Error> {
         Ok(path.is_file())
+    }
+
+    fn temporary_path(&self) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{:x}-{:x}.db",
+            std::process::id(),
+            self.temp_counter.fetch_add(1, Ordering::AcqRel),
+        ))
     }
 }
 

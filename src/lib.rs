@@ -6,7 +6,7 @@ use std::ffi::{c_void, CStr, CString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::os::raw::{c_char, c_int};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,9 @@ pub trait Vfs {
     /// Check if a database at `path` already exists.
     fn exists(&self, path: &Path) -> Result<bool, std::io::Error>;
 
+    /// Generate and return a path for a temporary database.
+    fn temporary_path(&self) -> PathBuf;
+
     /// Check access to `path`. The default implementation always returns `true`.
     fn access(&self, _path: &Path, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
@@ -82,7 +85,7 @@ pub struct OpenOptions {
     pub access: OpenAccess,
 
     /// The file should be deleted when it is closed.
-    pub delete_on_close: bool,
+    delete_on_close: bool,
 }
 
 /// The object type that is being opened.
@@ -166,7 +169,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
 ) -> Result<(), RegisterError> {
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 3,
-        xClose: Some(io::close::<F>),
+        xClose: Some(io::close::<V, F>),
         xRead: Some(io::read::<F>),
         xWrite: Some(io::write::<F>),
         xTruncate: Some(io::truncate::<F>),
@@ -234,14 +237,16 @@ const MAX_PATH_LENGTH: usize = 512;
 #[repr(C)]
 struct FileState<F> {
     base: ffi::sqlite3_file,
+    vfs: *mut ffi::sqlite3_vfs,
     ext: MaybeUninit<FileExt<F>>,
 }
 
 #[repr(C)]
 struct FileExt<F> {
     vfs_name: CString,
-    name: String,
+    path: PathBuf,
     file: F,
+    delete_on_close: bool,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
 }
 
@@ -258,20 +263,15 @@ mod vfs {
         flags: c_int,
         p_out_flags: *mut c_int,
     ) -> c_int {
-        if z_name.is_null() {
-            return ffi::SQLITE_CANTOPEN;
-        }
-        let name = CStr::from_ptr(z_name).to_string_lossy();
+        // TODO: any way to use OsStr instead?
+        let name =
+            (!z_name.is_null()).then(|| CStr::from_ptr(z_name).to_string_lossy().to_string());
         log::trace!("open z_name={:?} flags={}", name, flags);
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-
-        let path = CStr::from_ptr(z_name);
-        // TODO: any way to use OsStr instead?
-        let path = path.to_string_lossy().to_string();
 
         let mut opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
@@ -283,23 +283,34 @@ mod vfs {
             }
         };
 
+        if z_name.is_null() && !opts.delete_on_close {
+            return state.set_last_error(
+                ffi::SQLITE_CANTOPEN,
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "delete on close expected for temporary database",
+                ),
+            );
+        }
+
         let out_file = match (p_file as *mut FileState<F>).as_mut() {
             Some(f) => f,
             None => {
                 return state.set_last_error(
-                    ffi::SQLITE_ERROR,
+                    ffi::SQLITE_CANTOPEN,
                     std::io::Error::new(std::io::ErrorKind::Other, "invalid file pointer"),
-                )
+                );
             }
         };
 
-        let file = match state.vfs.open(path.as_ref(), opts.clone()) {
+        let path = name.map_or_else(|| state.vfs.temporary_path(), PathBuf::from);
+        let file = match state.vfs.open(&path, opts.clone()) {
             Ok(f) => f,
             Err(err) => {
                 if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
                     // Try again as readonly
                     opts.access = OpenAccess::Read;
-                    if let Ok(f) = state.vfs.open(path.as_ref(), opts.clone()) {
+                    if let Ok(f) = state.vfs.open(&path, opts.clone()) {
                         f
                     } else {
                         return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
@@ -315,10 +326,12 @@ mod vfs {
         }
 
         out_file.base.pMethods = &state.io_methods;
+        out_file.vfs = p_vfs;
         out_file.ext.write(FileExt {
             vfs_name: state.name.clone(),
-            name: name.to_string(),
+            path,
             file,
+            delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
         });
 
@@ -542,13 +555,22 @@ mod io {
     use super::*;
 
     /// Close a file.
-    pub unsafe extern "C" fn close<F>(p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn close<V: Vfs, F>(p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("close");
 
         if let Some(f) = (p_file as *mut FileState<F>).as_mut() {
+            let ext = f.ext.assume_init_ref();
+            if ext.delete_on_close {
+                if let Ok(state) = vfs_state::<V>(f.vfs) {
+                    if let Err(err) = state.vfs.delete(&ext.path) {
+                        return state.set_last_error(ffi::SQLITE_DELETE, err);
+                    }
+                }
+            }
+
             let ext = mem::replace(&mut f.ext, MaybeUninit::uninit());
             let ext = ext.assume_init(); // extract the value to drop it
-            log::trace!("close ({})", ext.name);
+            log::trace!("close ({:?})", ext.path);
         }
 
         ffi::SQLITE_OK
@@ -567,7 +589,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        log::trace!("read ({})", state.name);
+        log::trace!("read ({:?})", state.path);
 
         match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
             Ok(o) => {
@@ -606,7 +628,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
-        log::trace!("write ({})", state.name);
+        log::trace!("write ({:?})", state.path);
 
         match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
             Ok(o) => {
@@ -638,7 +660,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("truncate ({})", state.name);
+        log::trace!("truncate ({:?})", state.path);
 
         if let Err(err) = state.file.truncate(size as u64) {
             return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
@@ -658,7 +680,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("sync ({})", state.name);
+        log::trace!("sync ({:?})", state.path);
 
         #[cfg(feature = "sqlite_test")]
         {
@@ -691,7 +713,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        log::trace!("file_size ({})", state.name);
+        log::trace!("file_size ({:?})", state.path);
 
         if let Err(err) = state.file.file_size().and_then(|n| {
             let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().ok_or_else(null_ptr_error)?;
@@ -715,7 +737,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_LOCK,
         };
-        log::trace!("lock ({})", state.name);
+        log::trace!("lock ({:?})", state.path);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
@@ -739,7 +761,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_UNLOCK,
         };
-        log::trace!("unlock ({})", state.name);
+        log::trace!("unlock ({:?})", state.path);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
@@ -763,7 +785,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
-        log::trace!("unlock ({})", state.name);
+        log::trace!("unlock ({:?})", state.path);
 
         if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
