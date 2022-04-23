@@ -229,6 +229,11 @@ impl sqlite_vfs::DatabaseHandle for FileHandle {
                 self.lock = to;
                 Ok(true)
             }
+            (FileState::Exclusive, Lock::Exclusive, Lock::None) => {
+                *state = FileState::Read { count: 0 };
+                self.lock = to;
+                Ok(true)
+            }
 
             _ => {
                 panic!(
