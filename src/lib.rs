@@ -59,7 +59,7 @@ pub trait Vfs {
     type Handle: DatabaseHandle;
 
     /// Open the database (of type `opts.kind`) at `path`.
-    fn open(&mut self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error>;
+    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error>;
 
     /// Delete the database at `path`.
     fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
@@ -156,7 +156,7 @@ pub enum Lock {
 
 struct State<V> {
     name: CString,
-    vfs: V,
+    vfs: Arc<V>,
     io_methods: ffi::sqlite3_io_methods,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
 }
@@ -170,15 +170,15 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
     let io_methods = ffi::sqlite3_io_methods {
         iVersion: 3,
         xClose: Some(io::close::<V, F>),
-        xRead: Some(io::read::<F>),
-        xWrite: Some(io::write::<F>),
-        xTruncate: Some(io::truncate::<F>),
-        xSync: Some(io::sync::<F>),
-        xFileSize: Some(io::file_size::<F>),
-        xLock: Some(io::lock::<F>),
-        xUnlock: Some(io::unlock::<F>),
-        xCheckReservedLock: Some(io::check_reserved_lock::<F>),
-        xFileControl: Some(io::file_control::<F>),
+        xRead: Some(io::read::<V, F>),
+        xWrite: Some(io::write::<V, F>),
+        xTruncate: Some(io::truncate::<V, F>),
+        xSync: Some(io::sync::<V, F>),
+        xFileSize: Some(io::file_size::<V, F>),
+        xLock: Some(io::lock::<V, F>),
+        xUnlock: Some(io::unlock::<V, F>),
+        xCheckReservedLock: Some(io::check_reserved_lock::<V, F>),
+        xFileControl: Some(io::file_control::<V, F>),
         xSectorSize: Some(io::sector_size::<F>),
         xDeviceCharacteristics: Some(io::device_characteristics::<F>),
         xShmMap: Some(io::shm_map::<F>),
@@ -192,13 +192,13 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
     let name_ptr = name.as_ptr();
     let ptr = Box::into_raw(Box::new(State {
         name,
-        vfs,
+        vfs: Arc::new(vfs),
         io_methods,
         last_error: Default::default(),
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: 3,
-        szOsFile: size_of::<FileState<F>>() as i32,
+        szOsFile: size_of::<FileState<V, F>>() as i32,
         mxPathname: MAX_PATH_LENGTH as i32, // max path length supported by VFS
         pNext: null_mut(),
         zName: name_ptr,
@@ -235,14 +235,14 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
 const MAX_PATH_LENGTH: usize = 512;
 
 #[repr(C)]
-struct FileState<F> {
+struct FileState<V, F> {
     base: ffi::sqlite3_file,
-    vfs: *mut ffi::sqlite3_vfs,
-    ext: MaybeUninit<FileExt<F>>,
+    ext: MaybeUninit<FileExt<V, F>>,
 }
 
 #[repr(C)]
-struct FileExt<F> {
+struct FileExt<V, F> {
+    vfs: Arc<V>,
     vfs_name: CString,
     path: PathBuf,
     file: F,
@@ -293,7 +293,7 @@ mod vfs {
             );
         }
 
-        let out_file = match (p_file as *mut FileState<F>).as_mut() {
+        let out_file = match (p_file as *mut FileState<V, F>).as_mut() {
             Some(f) => f,
             None => {
                 return state.set_last_error(
@@ -326,8 +326,8 @@ mod vfs {
         }
 
         out_file.base.pMethods = &state.io_methods;
-        out_file.vfs = p_vfs;
         out_file.ext.write(FileExt {
+            vfs: state.vfs.clone(),
             vfs_name: state.name.clone(),
             path,
             file,
@@ -561,6 +561,7 @@ mod vfs {
 
 mod io {
     use std::mem;
+    use std::os::unix::prelude::OsStringExt;
 
     use super::*;
 
@@ -568,13 +569,11 @@ mod io {
     pub unsafe extern "C" fn close<V: Vfs, F>(p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("close");
 
-        if let Some(f) = (p_file as *mut FileState<F>).as_mut() {
-            let ext = f.ext.assume_init_ref();
+        if let Some(f) = (p_file as *mut FileState<V, F>).as_mut() {
+            let ext = f.ext.assume_init_mut();
             if ext.delete_on_close {
-                if let Ok(state) = vfs_state::<V>(f.vfs) {
-                    if let Err(err) = state.vfs.delete(&ext.path) {
-                        return state.set_last_error(ffi::SQLITE_DELETE, err);
-                    }
+                if let Err(err) = ext.vfs.delete(&ext.path) {
+                    return ext.set_last_error(ffi::SQLITE_DELETE, err);
                 }
             }
 
@@ -587,7 +586,7 @@ mod io {
     }
 
     /// Read data from a file.
-    pub unsafe extern "C" fn read<F: DatabaseHandle>(
+    pub unsafe extern "C" fn read<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         z_buf: *mut c_void,
         i_amt: c_int,
@@ -595,7 +594,7 @@ mod io {
     ) -> c_int {
         log::trace!("read offset={} len={}", i_ofst, i_amt);
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
@@ -626,7 +625,7 @@ mod io {
     }
 
     /// Write data to a file.
-    pub unsafe extern "C" fn write<F: DatabaseHandle>(
+    pub unsafe extern "C" fn write<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         z: *const c_void,
         i_amt: c_int,
@@ -634,7 +633,7 @@ mod io {
     ) -> c_int {
         log::trace!("write offset={} len={}", i_ofst, i_amt);
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
@@ -660,13 +659,13 @@ mod io {
     }
 
     /// Truncate a file.
-    pub unsafe extern "C" fn truncate<F: DatabaseHandle>(
+    pub unsafe extern "C" fn truncate<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         size: ffi::sqlite3_int64,
     ) -> c_int {
         log::trace!("truncate");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
@@ -680,13 +679,13 @@ mod io {
     }
 
     /// Persist changes to a file.
-    pub unsafe extern "C" fn sync<F: DatabaseHandle>(
+    pub unsafe extern "C" fn sync<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         flags: c_int,
     ) -> c_int {
         log::trace!("sync");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
@@ -713,13 +712,13 @@ mod io {
     }
 
     /// Return the current file-size of a file.
-    pub unsafe extern "C" fn file_size<F: DatabaseHandle>(
+    pub unsafe extern "C" fn file_size<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         p_size: *mut ffi::sqlite3_int64,
     ) -> c_int {
         log::trace!("file_size");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
@@ -737,13 +736,13 @@ mod io {
     }
 
     /// Lock a file.
-    pub unsafe extern "C" fn lock<F: DatabaseHandle>(
+    pub unsafe extern "C" fn lock<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         e_lock: c_int,
     ) -> c_int {
         log::trace!("lock");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_LOCK,
         };
@@ -761,13 +760,13 @@ mod io {
     }
 
     /// Unlock a file.
-    pub unsafe extern "C" fn unlock<F: DatabaseHandle>(
+    pub unsafe extern "C" fn unlock<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         e_lock: c_int,
     ) -> c_int {
         log::trace!("unlock");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_UNLOCK,
         };
@@ -785,13 +784,13 @@ mod io {
     }
 
     /// Check if another file-handle holds a [Lock::Reserved] lock on a file.
-    pub unsafe extern "C" fn check_reserved_lock<F: DatabaseHandle>(
+    pub unsafe extern "C" fn check_reserved_lock<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
         log::trace!("check_reserved_lock");
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
@@ -809,14 +808,14 @@ mod io {
     }
 
     /// File control method. For custom operations on a mem-file.
-    pub unsafe extern "C" fn file_control<F: DatabaseHandle>(
+    pub unsafe extern "C" fn file_control<V: Vfs, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         op: c_int,
         p_arg: *mut c_void,
     ) -> c_int {
         log::trace!("file_control op={}", op);
 
-        let state = match file_state::<F>(p_file) {
+        let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_NOTFOUND,
         };
@@ -896,7 +895,7 @@ mod io {
             // programs. Not implemented.
             ffi::SQLITE_FCNTL_WIN32_AV_RETRY => ffi::SQLITE_NOTFOUND,
 
-            // Enable or disable the persistent WAL setting. Not implemented,
+            // Enable or disable the persistent WAL setting. Not implemented.
             ffi::SQLITE_FCNTL_PERSIST_WAL => ffi::SQLITE_NOTFOUND,
 
             // Indicate that, unless it is rolled back for some reason, the entire database file
@@ -925,7 +924,17 @@ mod io {
             ffi::SQLITE_FCNTL_BUSYHANDLER => ffi::SQLITE_NOTFOUND,
 
             // Generate a temporary filename. Not implemented.
-            ffi::SQLITE_FCNTL_TEMPFILENAME => ffi::SQLITE_NOTFOUND,
+            ffi::SQLITE_FCNTL_TEMPFILENAME => {
+                if let Some(p_arg) = (p_arg as *mut *const c_char).as_mut() {
+                    let path = state.vfs.temporary_path();
+                    // unwrap() is fine as os strings are an arbitrary sequences of non-zero bytes
+                    let path = CString::new(path.into_os_string().into_vec()).unwrap();
+                    let path = ManuallyDrop::new(path);
+                    *p_arg = path.as_ptr();
+                };
+
+                ffi::SQLITE_OK
+            }
 
             // Query or set the maximum number of bytes that will be used for memory-mapped I/O.
             // Not implemented.
@@ -1100,7 +1109,7 @@ impl<V> State<V> {
     }
 }
 
-impl<F> FileExt<F> {
+impl<V, F> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
         *(self.last_error.lock().unwrap()) = Some((no, err));
         no
@@ -1119,10 +1128,10 @@ unsafe fn vfs_state<'a, V>(ptr: *mut ffi::sqlite3_vfs) -> Result<&'a mut State<V
     Ok(state)
 }
 
-unsafe fn file_state<'a, F>(
+unsafe fn file_state<'a, V, F>(
     ptr: *mut ffi::sqlite3_file,
-) -> Result<&'a mut FileExt<F>, std::io::Error> {
-    let f = (ptr as *mut FileState<F>)
+) -> Result<&'a mut FileExt<V, F>, std::io::Error> {
+    let f = (ptr as *mut FileState<V, F>)
         .as_mut()
         .ok_or_else(null_ptr_error)?;
     let ext = f.ext.assume_init_mut();

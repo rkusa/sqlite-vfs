@@ -12,7 +12,7 @@ use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs};
 /// memory.
 #[derive(Default)]
 pub struct FsVfs {
-    state: HashMap<PathBuf, Weak<Mutex<FileState>>>,
+    state: Mutex<HashMap<PathBuf, Weak<Mutex<FileState>>>>,
     temp_counter: AtomicUsize,
 }
 
@@ -41,7 +41,7 @@ enum FileState {
 impl Vfs for FsVfs {
     type Handle = FileHandle;
 
-    fn open(&mut self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
+    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
         match opts.access {
@@ -55,13 +55,13 @@ impl Vfs for FsVfs {
         }
         let f = o.open(path)?;
 
-        let state = if let Some(state) = self.state.get(path).and_then(|s| s.upgrade()) {
+        let mut state = self.state.lock().unwrap();
+        let state = if let Some(state) = state.get(path).and_then(|s| s.upgrade()) {
             state
         } else {
-            let state = Arc::new(Mutex::new(FileState::default()));
-            self.state
-                .insert(path.to_path_buf(), Arc::downgrade(&state));
-            state
+            let file_state = Arc::new(Mutex::new(FileState::default()));
+            state.insert(path.to_path_buf(), Arc::downgrade(&file_state));
+            file_state
         };
 
         Ok(FileHandle {
