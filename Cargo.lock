@@ -29,6 +29,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "durable-object"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "pretty_env_logger",
+]
+
+[[package]]
 name = "env_logger"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -201,6 +209,8 @@ dependencies = [
 name = "test-vfs"
 version = "0.1.0"
 dependencies = [
+ "durable-object",
+ "log",
  "pretty_env_logger",
  "sqlite-vfs",
 ]

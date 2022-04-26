@@ -11,6 +11,7 @@ keywords = ["sqlite", "vfs"]
 
 [workspace]
 members = [
+  "durable-object",
   "test-vfs",
 ]
 

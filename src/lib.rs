@@ -3,10 +3,9 @@
 //! using [register].
 
 use std::ffi::{c_void, CStr, CString};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::ErrorKind;
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
 use std::os::raw::{c_char, c_int};
-use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -17,13 +16,19 @@ use std::time::Instant;
 mod ffi;
 
 /// A file opened by [Vfs].
-pub trait DatabaseHandle: Read + Seek + Write {
-    /// Return the current file-size of the database.
-    fn file_size(&self) -> Result<u64, std::io::Error>;
+pub trait DatabaseHandle {
+    /// Return the current size in bytes of the database.
+    fn size(&self) -> Result<u64, std::io::Error>;
+
+    /// Reads the exact number of byte required to fill `buf` from the given `offset`.
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error>;
+
+    /// Attempts to write an entire `buf` starting from the given `offset`.
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error>;
 
     /// Make sure all writes are committed to the underlying storage. If `data_only` is set to
     /// `true`, only the data and not the metadata (like size, access time, etc) should be synced.
-    fn sync(&self, data_only: bool) -> Result<(), std::io::Error>;
+    fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error>;
 
     /// Truncat the database file to the specified `size`.
     fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
@@ -58,20 +63,20 @@ pub trait Vfs {
     /// The file returned by [Vfs::open].
     type Handle: DatabaseHandle;
 
-    /// Open the database (of type `opts.kind`) at `path`.
-    fn open(&self, path: &Path, opts: OpenOptions) -> Result<Self::Handle, std::io::Error>;
+    /// Open the database `db` (of type `opts.kind`).
+    fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, std::io::Error>;
 
-    /// Delete the database at `path`.
-    fn delete(&self, path: &Path) -> Result<(), std::io::Error>;
+    /// Delete the database `db`.
+    fn delete(&self, db: &str) -> Result<(), std::io::Error>;
 
-    /// Check if a database at `path` already exists.
-    fn exists(&self, path: &Path) -> Result<bool, std::io::Error>;
+    /// Check if a database `db` already exists.
+    fn exists(&self, db: &str) -> Result<bool, std::io::Error>;
 
     /// Generate and return a path for a temporary database.
-    fn temporary_path(&self) -> PathBuf;
+    fn temporary_name(&self) -> String;
 
-    /// Check access to `path`. The default implementation always returns `true`.
-    fn access(&self, _path: &Path, _write: bool) -> Result<bool, std::io::Error> {
+    /// Check access to `db`. The default implementation always returns `true`.
+    fn access(&self, _db: &str, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
     }
 }
@@ -244,7 +249,7 @@ struct FileState<V, F> {
 struct FileExt<V, F> {
     vfs: Arc<V>,
     vfs_name: CString,
-    path: PathBuf,
+    db_name: String,
     file: F,
     delete_on_close: bool,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
@@ -263,22 +268,35 @@ mod vfs {
         flags: c_int,
         p_out_flags: *mut c_int,
     ) -> c_int {
-        // TODO: any way to use OsStr instead?
-        let name =
-            (!z_name.is_null()).then(|| CStr::from_ptr(z_name).to_string_lossy().to_string());
-        log::trace!("open z_name={:?} flags={}", name, flags);
-
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
+
+        let name = if z_name.is_null() {
+            None
+        } else {
+            match CStr::from_ptr(z_name).to_str() {
+                Ok(name) => Some(name),
+                Err(_) => {
+                    return state.set_last_error(
+                        ffi::SQLITE_CANTOPEN,
+                        std::io::Error::new(
+                            ErrorKind::Other,
+                            "database must be defined and a valid utf8 string",
+                        ),
+                    )
+                }
+            }
+        };
+        log::trace!("open z_name={:?} flags={}", name, flags);
 
         let mut opts = match OpenOptions::from_flags(flags) {
             Some(opts) => opts,
             None => {
                 return state.set_last_error(
                     ffi::SQLITE_CANTOPEN,
-                    std::io::Error::new(std::io::ErrorKind::Other, "invalid open flags"),
+                    std::io::Error::new(ErrorKind::Other, "invalid open flags"),
                 );
             }
         };
@@ -287,7 +305,7 @@ mod vfs {
             return state.set_last_error(
                 ffi::SQLITE_CANTOPEN,
                 std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                    ErrorKind::Other,
                     "delete on close expected for temporary database",
                 ),
             );
@@ -298,19 +316,19 @@ mod vfs {
             None => {
                 return state.set_last_error(
                     ffi::SQLITE_CANTOPEN,
-                    std::io::Error::new(std::io::ErrorKind::Other, "invalid file pointer"),
+                    std::io::Error::new(ErrorKind::Other, "invalid file pointer"),
                 );
             }
         };
 
-        let path = name.map_or_else(|| state.vfs.temporary_path(), PathBuf::from);
-        let file = match state.vfs.open(&path, opts.clone()) {
+        let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
+        let file = match state.vfs.open(&name, opts.clone()) {
             Ok(f) => f,
             Err(err) => {
                 if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
                     // Try again as readonly
                     opts.access = OpenAccess::Read;
-                    if let Ok(f) = state.vfs.open(&path, opts.clone()) {
+                    if let Ok(f) = state.vfs.open(&name, opts.clone()) {
                         f
                     } else {
                         return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
@@ -329,7 +347,7 @@ mod vfs {
         out_file.ext.write(FileExt {
             vfs: state.vfs.clone(),
             vfs_name: state.name.clone(),
-            path,
+            db_name: name,
             file,
             delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
@@ -561,25 +579,22 @@ mod vfs {
 
 mod io {
     use std::mem;
-    use std::os::unix::prelude::OsStringExt;
 
     use super::*;
 
     /// Close a file.
     pub unsafe extern "C" fn close<V: Vfs, F>(p_file: *mut ffi::sqlite3_file) -> c_int {
-        log::trace!("close");
-
         if let Some(f) = (p_file as *mut FileState<V, F>).as_mut() {
             let ext = f.ext.assume_init_mut();
             if ext.delete_on_close {
-                if let Err(err) = ext.vfs.delete(&ext.path) {
+                if let Err(err) = ext.vfs.delete(&ext.db_name) {
                     return ext.set_last_error(ffi::SQLITE_DELETE, err);
                 }
             }
 
             let ext = mem::replace(&mut f.ext, MaybeUninit::uninit());
             let ext = ext.assume_init(); // extract the value to drop it
-            log::trace!("close ({:?})", ext.path);
+            log::trace!("close ({})", ext.db_name);
         }
 
         ffi::SQLITE_OK
@@ -592,27 +607,14 @@ mod io {
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
-        log::trace!("read offset={} len={}", i_ofst, i_amt);
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        log::trace!("read ({:?})", state.path);
-
-        match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
-            Ok(o) => {
-                if o != i_ofst as u64 {
-                    return ffi::SQLITE_IOERR_CORRUPTFS;
-                }
-            }
-            Err(err) => {
-                return state.set_last_error(ffi::SQLITE_IOERR_READ, err);
-            }
-        }
+        log::trace!("read offset={} len={} ({})", i_ofst, i_amt, state.db_name);
 
         let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
-        if let Err(err) = state.file.read_exact(out) {
+        if let Err(err) = state.file.read_exact_at(out, i_ofst as u64) {
             let kind = err.kind();
             if kind == ErrorKind::UnexpectedEof {
                 return ffi::SQLITE_IOERR_SHORT_READ;
@@ -631,27 +633,14 @@ mod io {
         i_amt: c_int,
         i_ofst: ffi::sqlite3_int64,
     ) -> c_int {
-        log::trace!("write offset={} len={}", i_ofst, i_amt);
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
-        log::trace!("write ({:?})", state.path);
-
-        match state.file.seek(SeekFrom::Start(i_ofst as u64)) {
-            Ok(o) => {
-                if o != i_ofst as u64 {
-                    return ffi::SQLITE_IOERR_WRITE;
-                }
-            }
-            Err(err) => {
-                return state.set_last_error(ffi::SQLITE_IOERR_WRITE, err);
-            }
-        }
+        log::trace!("write offset={} len={} ({})", i_ofst, i_amt, state.db_name);
 
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
-        if let Err(err) = state.file.write_all(data) {
+        if let Err(err) = state.file.write_all_at(data, i_ofst as u64) {
             return state.set_last_error(ffi::SQLITE_IOERR_WRITE, err);
         }
 
@@ -663,13 +652,11 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         size: ffi::sqlite3_int64,
     ) -> c_int {
-        log::trace!("truncate");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("truncate ({:?})", state.path);
+        log::trace!("truncate ({})", state.db_name);
 
         if let Err(err) = state.file.truncate(size as u64) {
             return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
@@ -683,13 +670,11 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         flags: c_int,
     ) -> c_int {
-        log::trace!("sync");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("sync ({:?})", state.path);
+        log::trace!("sync ({})", state.db_name);
 
         #[cfg(feature = "sqlite_test")]
         {
@@ -698,10 +683,6 @@ mod io {
                 ffi::sqlite3_inc_fullsync_count();
             }
             ffi::sqlite3_inc_sync_count();
-        }
-
-        if let Err(err) = state.file.flush() {
-            return state.set_last_error(ffi::SQLITE_IOERR_FSYNC, err);
         }
 
         if let Err(err) = state.file.sync(flags & ffi::SQLITE_SYNC_DATAONLY > 0) {
@@ -716,15 +697,13 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         p_size: *mut ffi::sqlite3_int64,
     ) -> c_int {
-        log::trace!("file_size");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        log::trace!("file_size ({:?})", state.path);
+        log::trace!("file_size ({})", state.db_name);
 
-        if let Err(err) = state.file.file_size().and_then(|n| {
+        if let Err(err) = state.file.size().and_then(|n| {
             let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().ok_or_else(null_ptr_error)?;
             *p_size = n as ffi::sqlite3_int64;
             Ok(())
@@ -740,13 +719,11 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         e_lock: c_int,
     ) -> c_int {
-        log::trace!("lock");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_LOCK,
         };
-        log::trace!("lock ({:?})", state.path);
+        log::trace!("lock ({})", state.db_name);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
@@ -764,13 +741,11 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         e_lock: c_int,
     ) -> c_int {
-        log::trace!("unlock");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_UNLOCK,
         };
-        log::trace!("unlock ({:?})", state.path);
+        log::trace!("unlock ({})", state.db_name);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
@@ -788,13 +763,11 @@ mod io {
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
     ) -> c_int {
-        log::trace!("check_reserved_lock");
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
-        log::trace!("unlock ({:?})", state.path);
+        log::trace!("check_reserved_lock ({})", state.db_name);
 
         if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
@@ -878,7 +851,7 @@ mod io {
                     None => {
                         return state.set_last_error(
                             ffi::SQLITE_NOTFOUND,
-                            std::io::Error::new(std::io::ErrorKind::Other, "expect chunk_size arg"),
+                            std::io::Error::new(ErrorKind::Other, "expect chunk_size arg"),
                         );
                     }
                 };
@@ -926,11 +899,11 @@ mod io {
             // Generate a temporary filename. Not implemented.
             ffi::SQLITE_FCNTL_TEMPFILENAME => {
                 if let Some(p_arg) = (p_arg as *mut *const c_char).as_mut() {
-                    let path = state.vfs.temporary_path();
+                    let name = state.vfs.temporary_name();
                     // unwrap() is fine as os strings are an arbitrary sequences of non-zero bytes
-                    let path = CString::new(path.into_os_string().into_vec()).unwrap();
-                    let path = ManuallyDrop::new(path);
-                    *p_arg = path.as_ptr();
+                    let name = CString::new(name.as_bytes()).unwrap();
+                    let name = ManuallyDrop::new(name);
+                    *p_arg = name.as_ptr();
                 };
 
                 ffi::SQLITE_OK
@@ -1104,6 +1077,7 @@ mod io {
 
 impl<V> State<V> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
+        log::error!("{}", err);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         no
     }
@@ -1111,6 +1085,7 @@ impl<V> State<V> {
 
 impl<V, F> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
+        log::error!("{}", err);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         no
     }

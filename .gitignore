@@ -6,3 +6,4 @@ target
 wasm-pack.log
 build/
 /db
+/test-vfs/sqlite

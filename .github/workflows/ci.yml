@@ -39,3 +39,5 @@ jobs:
 
       - name: Run SQLite tests
         uses: ./test-vfs
+        with:
+          args: test/all.test
