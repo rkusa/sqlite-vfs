@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::connection::Connection;
@@ -67,7 +67,8 @@ impl Server {
         let mut conn = Connection::<Response, Request>::new(stream);
 
         match conn.receive()? {
-            Some(Request::Open { db: path }) => {
+            Some(Request::Open { db }) => {
+                let path = normalize_path(Path::new(&db)).to_string_lossy().to_string();
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
                     objects.entry(path.clone()).or_default().clone()
@@ -100,9 +101,10 @@ impl Server {
                 Ok(())
             }
             Some(Request::Delete { db }) => {
+                let path = normalize_path(Path::new(&db)).to_string_lossy().to_string();
                 let mut file_locks = self.file_locks.write().unwrap();
-                file_locks.remove(&db);
-                fs::remove_file(db)?;
+                file_locks.remove(&path);
+                fs::remove_file(path)?;
                 conn.send(Response::Delete)?;
                 Ok(())
             }
@@ -309,4 +311,32 @@ impl Drop for FileConnection {
             self.lock(Lock::None).ok();
         }
     }
+}
+
+// Source: https://github.com/rust-lang/cargo/blob/7a3b56b4860c0e58dab815549a93198a1c335b64/crates/cargo-util/src/paths.rs#L81
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
 }
