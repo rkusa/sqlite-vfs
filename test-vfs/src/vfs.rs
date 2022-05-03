@@ -94,18 +94,25 @@ impl sqlite_vfs::DatabaseHandle for Connection {
         }
 
         let mut client = self.client.lock().unwrap();
-        let ok = client.lock(match to {
+        let lock = client.lock(match to {
             Lock::None => durable_object::request::Lock::None,
             Lock::Shared => durable_object::request::Lock::Shared,
             Lock::Reserved => durable_object::request::Lock::Reserved,
             Lock::Pending => durable_object::request::Lock::Pending,
             Lock::Exclusive => durable_object::request::Lock::Exclusive,
         })?;
-        if ok {
-            self.lock = to;
+        if let Some(lock) = lock {
+            self.lock = match lock {
+                durable_object::request::Lock::None => Lock::None,
+                durable_object::request::Lock::Shared => Lock::Shared,
+                durable_object::request::Lock::Reserved => Lock::Reserved,
+                durable_object::request::Lock::Pending => Lock::Pending,
+                durable_object::request::Lock::Exclusive => Lock::Exclusive,
+            };
+            Ok(self.lock == to)
+        } else {
+            Ok(false)
         }
-
-        Ok(ok)
     }
 
     fn is_reserved(&self) -> Result<bool, std::io::Error> {
@@ -113,21 +120,8 @@ impl sqlite_vfs::DatabaseHandle for Connection {
             return Ok(true);
         }
 
-        // check whether the file is reserved by trying to acquire a reserved lock (not an optimal
-        // solution but should suffice for this test vfs)
-        let is_shared = self.lock == Lock::Shared;
         let mut client = self.client.lock().unwrap();
-        if client.lock(durable_object::request::Lock::Reserved)? {
-            // restore previous lock
-            client.lock(if is_shared {
-                durable_object::request::Lock::Shared
-            } else {
-                durable_object::request::Lock::None
-            })?;
-            return Ok(false);
-        }
-
-        Ok(true)
+        client.is_reserved()
     }
 
     fn current_lock(&self) -> Result<Lock, std::io::Error> {

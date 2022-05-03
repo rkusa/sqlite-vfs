@@ -56,11 +56,11 @@ impl Client {
         }
     }
 
-    pub fn lock(&mut self, lock: Lock) -> io::Result<bool> {
+    pub fn lock(&mut self, lock: Lock) -> io::Result<Option<Lock>> {
         let res = self.send(Request::Lock { lock })?;
         match res {
-            Response::Lock => Ok(true),
-            Response::Denied => Ok(false),
+            Response::Lock(lock) => Ok(Some(lock)),
+            Response::Denied => Ok(None),
             _ => Err(io::Error::new(
                 ErrorKind::Other,
                 "received unexpected response",
@@ -114,6 +114,18 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    pub fn is_reserved(&mut self) -> io::Result<bool> {
+        let res = self.send(Request::Reserved)?;
+        if let Response::Reserved(reserved) = res {
+            Ok(reserved)
+        } else {
+            Err(io::Error::new(
+                ErrorKind::Other,
+                "received unexpected response",
+            ))
+        }
     }
 
     fn send(&mut self, req: Request) -> io::Result<Response> {

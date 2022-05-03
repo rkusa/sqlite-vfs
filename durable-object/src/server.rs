@@ -13,11 +13,12 @@ use super::response::Response;
 #[derive(Default)]
 pub struct Server {
     #[allow(clippy::type_complexity)]
-    file_locks: Arc<RwLock<HashMap<String, Arc<RwLock<FileLock>>>>>,
+    file_locks: Arc<RwLock<HashMap<PathBuf, Arc<RwLock<FileLock>>>>>,
 }
 
 pub struct FileConnection {
     conn: Connection<Response, Request>,
+    path: PathBuf,
     file: File,
     file_lock: Arc<RwLock<FileLock>>,
     conn_lock: Lock,
@@ -68,7 +69,7 @@ impl Server {
 
         match conn.receive()? {
             Some(Request::Open { db }) => {
-                let path = normalize_path(Path::new(&db)).to_string_lossy().to_string();
+                let path = normalize_path(Path::new(&db));
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
                     objects.entry(path.clone()).or_default().clone()
@@ -97,11 +98,11 @@ impl Server {
                     }
                 };
 
-                FileConnection::handle(conn, f, file_lock)?;
+                FileConnection::handle(conn, path, f, file_lock)?;
                 Ok(())
             }
             Some(Request::Delete { db }) => {
-                let path = normalize_path(Path::new(&db)).to_string_lossy().to_string();
+                let path = normalize_path(Path::new(&db));
                 let mut file_locks = self.file_locks.write().unwrap();
                 file_locks.remove(&path);
                 fs::remove_file(path)?;
@@ -124,11 +125,13 @@ impl Server {
 impl FileConnection {
     fn handle(
         conn: Connection<Response, Request>,
+        path: PathBuf,
         file: File,
         file_lock: Arc<RwLock<FileLock>>,
     ) -> io::Result<()> {
         let mut conn = Self {
             conn,
+            path,
             file,
             file_lock,
             conn_lock: Lock::None,
@@ -148,11 +151,18 @@ impl FileConnection {
                 Ok(Response::Denied)
             }
             Request::Lock { lock: to } => {
+                log::debug!(
+                    "request lock {:?} -> {:?} @ {:?} ({:?})",
+                    self.conn_lock,
+                    to,
+                    self.file_lock.read().unwrap(),
+                    self.path,
+                );
                 if self.lock(to)? {
-                    log::trace!("lock {:?} granted", to);
-                    Ok(Response::Lock)
+                    log::debug!("lock {:?} granted ({:?})", self.conn_lock, self.path);
+                    Ok(Response::Lock(self.conn_lock))
                 } else {
-                    log::trace!("lock {:?} denied", to);
+                    log::debug!("lock {:?} denied ({:?})", to, self.path);
                     Ok(Response::Denied)
                 }
             }
@@ -178,6 +188,13 @@ impl FileConnection {
             Request::Truncate { len } => {
                 self.file.set_len(len)?;
                 Ok(Response::Truncate)
+            }
+            Request::Reserved => {
+                let file_lock = self.file_lock.read().unwrap();
+                Ok(Response::Reserved(matches!(
+                    &*file_lock,
+                    FileLock::Pending { .. } | FileLock::Reserved { .. } | FileLock::Exclusive
+                )))
             }
         }
     }
@@ -246,7 +263,7 @@ impl FileConnection {
                 } else {
                     *file_lock = FileLock::Pending { count };
                     self.conn_lock = Lock::Pending;
-                    Ok(false)
+                    Ok(true)
                 }
             }
 

@@ -14,6 +14,7 @@ pub enum Request {
     Put { dst: u64, data: Vec<u8> },
     Size,
     Truncate { len: u64 },
+    Reserved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,6 +99,7 @@ impl Decode for Request {
                 );
                 Ok(Request::Truncate { len })
             }
+            9 => Ok(Request::Reserved),
             type_ => Err(std::io::Error::new(
                 ErrorKind::Other,
                 format!("invalid request type `{}`", type_),
@@ -156,6 +158,11 @@ impl Encode for Request {
                 let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u64>());
                 d.extend_from_slice(&8u16.to_be_bytes()); // type
                 d.extend_from_slice(&len.to_be_bytes()); // len
+                d
+            }
+            Request::Reserved => {
+                let mut d = Vec::with_capacity(size_of::<u16>());
+                d.extend_from_slice(&9u16.to_be_bytes()); // type
                 d
             }
         }
@@ -248,6 +255,13 @@ mod tests {
     #[test]
     fn test_request_truncate_encode_decode() {
         let req = Request::Truncate { len: 42 };
+        let encoded = req.encode();
+        assert_eq!(Request::decode(&encoded).unwrap(), req);
+    }
+
+    #[test]
+    fn test_request_reserved_encode_decode() {
+        let req = Request::Reserved;
         let encoded = req.encode();
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
