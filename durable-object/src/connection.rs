@@ -38,7 +38,7 @@ where
         let payload = req.encode();
         // write length
         self.stream
-            .write_all(&((size_of::<u16>() + payload.len()) as u16).to_be_bytes())?;
+            .write_all(&((size_of::<u32>() + payload.len()) as u32).to_be_bytes())?;
         self.stream.write_all(&payload)?;
         log::trace!("send: {:?}", req);
 
@@ -64,12 +64,13 @@ where
             chunk_len += n;
             // log::trace!("received data: {:?}", &self.buffer[..chunk_len]);
 
-            // make sure to have at least 2 bytes necessary to read the expected message length
-            if chunk_len < 2 {
+            // make sure to have at least 4 bytes necessary to read the expected message length
+            if chunk_len < size_of::<u32>() {
                 continue;
             }
 
-            let msg_len = u16::from_be_bytes([self.buffer[0], self.buffer[1]]) as usize;
+            let msg_len = u32::from_be_bytes(self.buffer[0..4].try_into().unwrap()) as usize;
+            log::trace!("msg_len={}", msg_len);
             if msg_len > self.buffer.len() {
                 self.buffer.resize(msg_len, 0);
                 continue;
@@ -88,7 +89,7 @@ where
                     ),
                 ));
             }
-            let res = Res::decode(&self.buffer[2..msg_len])?;
+            let res = Res::decode(&self.buffer[4..msg_len])?;
             log::trace!("received: {:?}", res);
 
             self.buffer.resize(4096, 0);
