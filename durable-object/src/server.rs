@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::connection::Connection;
+use crate::request::OpenAccess;
 
 use super::request::{Lock, Request};
 use super::response::Response;
@@ -68,7 +69,7 @@ impl Server {
         let mut conn = Connection::<Response, Request>::new(stream);
 
         match conn.receive()? {
-            Some(Request::Open { db }) => {
+            Some(Request::Open { access, db }) => {
                 let path = normalize_path(Path::new(&db));
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
@@ -76,23 +77,23 @@ impl Server {
                 };
 
                 let mut o = fs::OpenOptions::new();
-                o.read(true).write(true).create(true);
-                // o.read(true).write(opts.access != OpenAccess::Read);
-                // match opts.access {
-                //     OpenAccess::Create => {
-                //         o.create(true);
-                //     }
-                //     OpenAccess::CreateNew => {
-                //         o.create_new(true);
-                //     }
-                //     _ => {}
-                // }
+                o.read(true).write(access != OpenAccess::Read);
+                match access {
+                    OpenAccess::Create => {
+                        o.create(true);
+                    }
+                    OpenAccess::CreateNew => {
+                        o.create_new(true);
+                    }
+                    _ => {}
+                }
                 let f = match o.open(&path) {
                     Ok(f) => {
                         conn.send(Response::Open)?;
                         f
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        log::error!("open error: {}", err);
                         conn.send(Response::Denied)?;
                         return Ok(());
                     }

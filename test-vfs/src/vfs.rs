@@ -1,4 +1,3 @@
-use std::fs;
 use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -16,7 +15,6 @@ pub struct TestVfs {
 
 pub struct Connection {
     client: Mutex<Client>,
-    db: String,
     lock: Lock,
 }
 
@@ -26,8 +24,16 @@ impl Vfs for TestVfs {
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
         // TODO: open options
         Ok(Connection {
-            client: Mutex::new(Client::connect("127.0.0.1:6000", db)?),
-            db: db.to_string(),
+            client: Mutex::new(Client::connect(
+                "127.0.0.1:6000",
+                db,
+                match opts.access {
+                    OpenAccess::Read => durable_object::request::OpenAccess::Read,
+                    OpenAccess::Write => durable_object::request::OpenAccess::Write,
+                    OpenAccess::Create => durable_object::request::OpenAccess::Create,
+                    OpenAccess::CreateNew => durable_object::request::OpenAccess::CreateNew,
+                },
+            )?),
             lock: Lock::default(),
         })
     }

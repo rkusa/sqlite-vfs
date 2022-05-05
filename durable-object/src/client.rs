@@ -3,7 +3,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Range;
 
 use crate::connection::Connection;
-use crate::request::{Lock, Request};
+use crate::request::{Lock, OpenAccess, Request};
 use crate::response::Response;
 
 pub struct Client {
@@ -11,11 +11,14 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn connect(addr: impl ToSocketAddrs, db: &str) -> io::Result<Self> {
+    pub fn connect(addr: impl ToSocketAddrs, db: &str, access: OpenAccess) -> io::Result<Self> {
         let mut client = Client {
             conn: Connection::new(TcpStream::connect(addr)?),
         };
-        let res = client.send(Request::Open { db: db.to_string() })?;
+        let res = client.send(Request::Open {
+            access,
+            db: db.to_string(),
+        })?;
         match res {
             Response::Open => Ok(client),
             Response::Denied => Err(ErrorKind::PermissionDenied.into()),

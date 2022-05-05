@@ -6,7 +6,7 @@ use crate::connection::{Decode, Encode};
 
 #[derive(Debug, PartialEq)]
 pub enum Request {
-    Open { db: String },
+    Open { access: OpenAccess, db: String },
     Delete { db: String },
     Exists { db: String },
     Lock { lock: Lock },
@@ -27,6 +27,14 @@ pub enum Lock {
     Exclusive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenAccess {
+    Read = 1,
+    Write,
+    Create,
+    CreateNew,
+}
+
 impl Decode for Request {
     fn decode(data: &[u8]) -> std::io::Result<Self> {
         let type_ = u16::from_be_bytes(
@@ -36,9 +44,29 @@ impl Decode for Request {
         );
 
         match type_ {
-            1 => Ok(Request::Open {
-                db: String::from_utf8_lossy(&data[2..]).to_string(),
-            }),
+            1 => {
+                let access = u16::from_be_bytes(
+                    data[2..4]
+                        .try_into()
+                        .map_err(|err| std::io::Error::new(ErrorKind::UnexpectedEof, err))?,
+                );
+                let access = match access {
+                    1 => OpenAccess::Read,
+                    2 => OpenAccess::Write,
+                    3 => OpenAccess::Create,
+                    4 => OpenAccess::CreateNew,
+                    access => {
+                        return Err(std::io::Error::new(
+                            ErrorKind::Other,
+                            format!("invalid access `{}`", access),
+                        ))
+                    }
+                };
+                Ok(Request::Open {
+                    access,
+                    db: String::from_utf8_lossy(&data[4..]).to_string(),
+                })
+            }
             2 => Ok(Request::Delete {
                 db: String::from_utf8_lossy(&data[2..]).to_string(),
             }),
@@ -111,9 +139,10 @@ impl Decode for Request {
 impl Encode for Request {
     fn encode(&self) -> Vec<u8> {
         match self {
-            Request::Open { db } => {
-                let mut d = Vec::with_capacity(db.len() + size_of::<u16>());
+            Request::Open { access, db } => {
+                let mut d = Vec::with_capacity(2 * size_of::<u16>() + db.len());
                 d.extend_from_slice(&1u16.to_be_bytes()); // type
+                d.extend_from_slice(&(*access as u16).to_be_bytes()); // access
                 d.extend_from_slice(db.as_bytes()); // db path
                 d
             }
@@ -174,13 +203,14 @@ mod tests {
     use std::ops::Range;
 
     use crate::connection::{Decode, Encode};
-    use crate::request::Lock;
+    use crate::request::{Lock, OpenAccess};
 
     use super::Request;
 
     #[test]
     fn test_request_open_encode_decode() {
         let req = Request::Open {
+            access: OpenAccess::CreateNew,
             db: "test.db".to_string(),
         };
         let encoded = req.encode();
