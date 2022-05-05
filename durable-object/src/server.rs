@@ -171,12 +171,19 @@ impl FileConnection {
                 self.file.seek(SeekFrom::Start(src.start))?;
 
                 let mut data = vec![0; (src.end - src.start) as usize];
-                match self.file.read_exact(&mut data) {
-                    Ok(_) => {}
-                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => {}
-                    Err(err) => return Err(err),
+                let mut offset = 0;
+                while offset < data.len() {
+                    match self.file.read(&mut data[offset..]) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            offset += n;
+                        }
+                        Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
                 }
 
+                data.resize(offset, 0);
                 Ok(Response::Get(data))
             }
             Request::Put { dst, data } => {
