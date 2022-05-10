@@ -12,8 +12,10 @@ pub struct Client {
 
 impl Client {
     pub fn connect(addr: impl ToSocketAddrs, db: &str, access: OpenAccess) -> io::Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
         let mut client = Client {
-            conn: Connection::new(TcpStream::connect(addr)?),
+            conn: Connection::new(stream),
         };
         let res = client.send(Request::Open { access, db })?;
         match res {
@@ -27,8 +29,10 @@ impl Client {
     }
 
     pub fn delete(addr: impl ToSocketAddrs, db: &str) -> io::Result<()> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
         let mut client = Client {
-            conn: Connection::new(TcpStream::connect(addr)?),
+            conn: Connection::new(stream),
         };
         let res = client.send(Request::Delete { db })?;
         if res != Response::Delete {

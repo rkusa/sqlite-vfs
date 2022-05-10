@@ -26,6 +26,7 @@ impl Connection {
         self.stream
             .write_all(&((size_of::<u32>() + self.send_buffer.len()) as u32).to_be_bytes())?;
         self.stream.write_all(&self.send_buffer)?;
+        self.stream.flush()?;
 
         Ok(())
     }

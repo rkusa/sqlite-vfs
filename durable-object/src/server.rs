@@ -4,6 +4,7 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use crate::connection::Connection;
 use crate::request::OpenAccess;
@@ -55,6 +56,8 @@ impl Server {
         for stream in listener.incoming() {
             let stream = stream?;
             log::trace!("received new client connection");
+
+            stream.set_nodelay(true)?;
 
             let server = server.clone();
             std::thread::spawn(move || {
