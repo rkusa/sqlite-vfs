@@ -18,11 +18,11 @@ pub struct Server {
 }
 
 pub struct FileConnection {
-    conn: Connection<Response, Request>,
     path: PathBuf,
     file: File,
     file_lock: Arc<RwLock<FileLock>>,
     conn_lock: Lock,
+    buffer: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +38,8 @@ enum FileLock {
     /// The object has an [Lock::Exclusive] lock.
     Exclusive,
 }
+
+struct ServerConnection(Connection);
 
 impl Server {
     pub fn start(self, addr: impl ToSocketAddrs) -> io::Result<()> {
@@ -66,7 +68,7 @@ impl Server {
     }
 
     fn handle_client(self: Arc<Server>, stream: TcpStream) -> io::Result<()> {
-        let mut conn = Connection::<Response, Request>::new(stream);
+        let mut conn = ServerConnection(Connection::new(stream));
 
         match conn.receive()? {
             Some(Request::Open { access, db }) => {
@@ -111,7 +113,8 @@ impl Server {
                 Ok(())
             }
             Some(Request::Exists { db }) => {
-                conn.send(Response::Exists(Path::new(&db).is_file()))?;
+                let exists = Path::new(db).is_file();
+                conn.send(Response::Exists(exists))?;
                 Ok(())
             }
             Some(_) => Err(io::Error::new(
@@ -123,24 +126,44 @@ impl Server {
     }
 }
 
+impl ServerConnection {
+    fn receive(&mut self) -> io::Result<Option<Request>> {
+        let res = self.0.receive()?;
+        match res {
+            Some(res) => {
+                let res = Request::decode(res)?;
+                log::trace!("received {:?}", res);
+                Ok(Some(res))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn send(&mut self, req: Response) -> io::Result<()> {
+        self.0.send(|data: &mut Vec<u8>| req.encode(data))?;
+        log::trace!("sent {:?}", req);
+        Ok(())
+    }
+}
+
 impl FileConnection {
     fn handle(
-        conn: Connection<Response, Request>,
+        mut conn: ServerConnection,
         path: PathBuf,
         file: File,
         file_lock: Arc<RwLock<FileLock>>,
     ) -> io::Result<()> {
-        let mut conn = Self {
-            conn,
+        let mut file_conn = Self {
             path,
             file,
             file_lock,
             conn_lock: Lock::None,
+            buffer: Vec::with_capacity(4096),
         };
 
-        while let Some(req) = conn.conn.receive()? {
-            let res = conn.handle_request(req)?;
-            conn.conn.send(res)?;
+        while let Some(req) = conn.receive()? {
+            let res = file_conn.handle_request(req)?;
+            conn.send(res)?;
         }
 
         Ok(())
@@ -170,10 +193,11 @@ impl FileConnection {
             Request::Get { src } => {
                 self.file.seek(SeekFrom::Start(src.start))?;
 
-                let mut data = vec![0; (src.end - src.start) as usize];
+                self.buffer.resize((src.end - src.start) as usize, 0);
+                self.buffer.shrink_to((src.end - src.start) as usize);
                 let mut offset = 0;
-                while offset < data.len() {
-                    match self.file.read(&mut data[offset..]) {
+                while offset < self.buffer.len() {
+                    match self.file.read(&mut self.buffer[offset..]) {
                         Ok(0) => break,
                         Ok(n) => {
                             offset += n;
@@ -183,12 +207,12 @@ impl FileConnection {
                     }
                 }
 
-                data.resize(offset, 0);
-                Ok(Response::Get(data))
+                self.buffer.resize(offset, 0);
+                Ok(Response::Get(&self.buffer))
             }
             Request::Put { dst, data } => {
                 self.file.seek(SeekFrom::Start(dst))?;
-                self.file.write_all(&data)?;
+                self.file.write_all(data)?;
                 self.file.flush()?;
                 Ok(Response::Put)
             }

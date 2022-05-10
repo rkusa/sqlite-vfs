@@ -11,7 +11,7 @@ fn main() -> io::Result<()> {
         durable_object::request::OpenAccess::Create,
     )?;
     let data = "Some data ...".as_bytes();
-    client.put(0, data.to_vec())?;
+    client.put(0, data)?;
     assert_eq!(client.get(0..data.len() as u64)?, data);
 
     Ok(())

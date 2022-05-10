@@ -1,17 +1,14 @@
 use std::io::ErrorKind;
-use std::mem::size_of;
 use std::ops::Range;
 
-use crate::connection::{Decode, Encode};
-
 #[derive(Debug, PartialEq)]
-pub enum Request {
-    Open { access: OpenAccess, db: String },
-    Delete { db: String },
-    Exists { db: String },
+pub enum Request<'a> {
+    Open { access: OpenAccess, db: &'a str },
+    Delete { db: &'a str },
+    Exists { db: &'a str },
     Lock { lock: Lock },
     Get { src: Range<u64> },
-    Put { dst: u64, data: Vec<u8> },
+    Put { dst: u64, data: &'a [u8] },
     Size,
     Truncate { len: u64 },
     Reserved,
@@ -35,8 +32,8 @@ pub enum OpenAccess {
     CreateNew,
 }
 
-impl Decode for Request {
-    fn decode(data: &[u8]) -> std::io::Result<Self> {
+impl<'a> Request<'a> {
+    pub fn decode(data: &'a [u8]) -> std::io::Result<Self> {
         let type_ = u16::from_be_bytes(
             data[0..2]
                 .try_into()
@@ -64,14 +61,14 @@ impl Decode for Request {
                 };
                 Ok(Request::Open {
                     access,
-                    db: String::from_utf8_lossy(&data[4..]).to_string(),
+                    db: std::str::from_utf8(&data[4..]).unwrap(),
                 })
             }
             2 => Ok(Request::Delete {
-                db: String::from_utf8_lossy(&data[2..]).to_string(),
+                db: std::str::from_utf8(&data[2..]).unwrap(),
             }),
             3 => Ok(Request::Exists {
-                db: String::from_utf8_lossy(&data[2..]).to_string(),
+                db: std::str::from_utf8(&data[2..]).unwrap(),
             }),
             4 => {
                 let lock = u16::from_be_bytes(
@@ -115,8 +112,10 @@ impl Decode for Request {
                         .try_into()
                         .map_err(|err| std::io::Error::new(ErrorKind::UnexpectedEof, err))?,
                 );
-                let data = data[10..].to_vec();
-                Ok(Request::Put { dst, data })
+                Ok(Request::Put {
+                    dst,
+                    data: &data[10..],
+                })
             }
             7 => Ok(Request::Size),
             8 => {
@@ -134,65 +133,45 @@ impl Decode for Request {
             )),
         }
     }
-}
 
-impl Encode for Request {
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, buffer: &mut Vec<u8>) {
         match self {
             Request::Open { access, db } => {
-                let mut d = Vec::with_capacity(2 * size_of::<u16>() + db.len());
-                d.extend_from_slice(&1u16.to_be_bytes()); // type
-                d.extend_from_slice(&(*access as u16).to_be_bytes()); // access
-                d.extend_from_slice(db.as_bytes()); // db path
-                d
+                buffer.extend_from_slice(&1u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&(*access as u16).to_be_bytes()); // access
+                buffer.extend_from_slice(db.as_bytes()); // db path
             }
             Request::Delete { db } => {
-                let mut d = Vec::with_capacity(db.len() + size_of::<u16>());
-                d.extend_from_slice(&2u16.to_be_bytes()); // type
-                d.extend_from_slice(db.as_bytes()); // db path
-                d
+                buffer.extend_from_slice(&2u16.to_be_bytes()); // type
+                buffer.extend_from_slice(db.as_bytes()); // db path
             }
             Request::Exists { db } => {
-                let mut d = Vec::with_capacity(db.len() + size_of::<u16>());
-                d.extend_from_slice(&3u16.to_be_bytes()); // type
-                d.extend_from_slice(db.as_bytes()); // db path
-                d
+                buffer.extend_from_slice(&3u16.to_be_bytes()); // type
+                buffer.extend_from_slice(db.as_bytes()); // db path
             }
             Request::Lock { lock } => {
-                let mut d = Vec::with_capacity(2 * size_of::<u16>());
-                d.extend_from_slice(&4u16.to_be_bytes()); // type
-                d.extend_from_slice(&(*lock as u16).to_be_bytes()); // lock
-                d
+                buffer.extend_from_slice(&4u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&(*lock as u16).to_be_bytes()); // lock
             }
             Request::Get { src } => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + 2 * size_of::<u64>());
-                d.extend_from_slice(&5u16.to_be_bytes()); // type
-                d.extend_from_slice(&src.start.to_be_bytes()); // start
-                d.extend_from_slice(&src.end.to_be_bytes()); // end
-                d
+                buffer.extend_from_slice(&5u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&src.start.to_be_bytes()); // start
+                buffer.extend_from_slice(&src.end.to_be_bytes()); // end
             }
             Request::Put { dst, data } => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u64>() + data.len());
-                d.extend_from_slice(&6u16.to_be_bytes()); // type
-                d.extend_from_slice(&dst.to_be_bytes()); // dst
-                d.extend_from_slice(data); // end
-                d
+                buffer.extend_from_slice(&6u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&dst.to_be_bytes()); // dst
+                buffer.extend_from_slice(data); // end
             }
             Request::Size => {
-                let mut d = Vec::with_capacity(size_of::<u16>());
-                d.extend_from_slice(&7u16.to_be_bytes()); // type
-                d
+                buffer.extend_from_slice(&7u16.to_be_bytes()); // type
             }
             Request::Truncate { len } => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u64>());
-                d.extend_from_slice(&8u16.to_be_bytes()); // type
-                d.extend_from_slice(&len.to_be_bytes()); // len
-                d
+                buffer.extend_from_slice(&8u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&len.to_be_bytes()); // len
             }
             Request::Reserved => {
-                let mut d = Vec::with_capacity(size_of::<u16>());
-                d.extend_from_slice(&9u16.to_be_bytes()); // type
-                d
+                buffer.extend_from_slice(&9u16.to_be_bytes()); // type
             }
         }
     }
@@ -202,7 +181,6 @@ impl Encode for Request {
 mod tests {
     use std::ops::Range;
 
-    use crate::connection::{Decode, Encode};
     use crate::request::{Lock, OpenAccess};
 
     use super::Request;
@@ -211,27 +189,26 @@ mod tests {
     fn test_request_open_encode_decode() {
         let req = Request::Open {
             access: OpenAccess::CreateNew,
-            db: "test.db".to_string(),
+            db: "test.db",
         };
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_delete_encode_decode() {
-        let req = Request::Delete {
-            db: "test.db".to_string(),
-        };
-        let encoded = req.encode();
+        let req = Request::Delete { db: "test.db" };
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_exists_encode_decode() {
-        let req = Request::Exists {
-            db: "test.db".to_string(),
-        };
-        let encoded = req.encode();
+        let req = Request::Exists { db: "test.db" };
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
@@ -248,7 +225,8 @@ mod tests {
                     _ => unreachable!(),
                 },
             };
-            let encoded = req.encode();
+            let mut encoded = Vec::new();
+            req.encode(&mut encoded);
             assert_eq!(Request::decode(&encoded).unwrap(), req);
         }
     }
@@ -261,38 +239,44 @@ mod tests {
                 end: 128,
             },
         };
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_put_encode_decode() {
+        let data: Vec<u8> = std::iter::successors(Some(0u8), |n| n.checked_add(1)).collect();
         let req = Request::Put {
             dst: 32,
-            data: std::iter::successors(Some(0u8), |n| n.checked_add(1)).collect(),
+            data: &data,
         };
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_size_encode_decode() {
         let req = Request::Size;
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_truncate_encode_decode() {
         let req = Request::Truncate { len: 42 };
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 
     #[test]
     fn test_request_reserved_encode_decode() {
         let req = Request::Reserved;
-        let encoded = req.encode();
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
     }
 }

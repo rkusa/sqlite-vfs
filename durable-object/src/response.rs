@@ -1,16 +1,14 @@
 use std::io::ErrorKind;
-use std::mem::size_of;
 
-use crate::connection::{Decode, Encode};
 use crate::request::Lock;
 
 #[derive(Debug, PartialEq)]
-pub enum Response {
+pub enum Response<'a> {
     Open,
     Delete,
     Exists(bool),
     Lock(Lock),
-    Get(Vec<u8>),
+    Get(&'a [u8]),
     Put,
     Size(u64),
     Truncate,
@@ -21,8 +19,8 @@ pub enum Response {
     Denied,
 }
 
-impl Decode for Response {
-    fn decode(data: &[u8]) -> std::io::Result<Self> {
+impl<'a> Response<'a> {
+    pub fn decode(data: &'a [u8]) -> std::io::Result<Self> {
         let type_ = u16::from_be_bytes(
             data[0..2]
                 .try_into()
@@ -54,7 +52,7 @@ impl Decode for Response {
                 };
                 Ok(Response::Lock(lock))
             }
-            5 => Ok(Response::Get(data[2..].to_vec())),
+            5 => Ok(Response::Get(&data[2..])),
             6 => Ok(Response::Put),
             7 => {
                 let len = u64::from_be_bytes(
@@ -73,123 +71,121 @@ impl Decode for Response {
             )),
         }
     }
-}
 
-impl Encode for Response {
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, buffer: &mut Vec<u8>) {
         match self {
-            Response::Open => 1u16.to_be_bytes().to_vec(),
-            Response::Delete => 2u16.to_be_bytes().to_vec(),
+            Response::Open => buffer.extend_from_slice(&1u16.to_be_bytes()),
+            Response::Delete => buffer.extend_from_slice(&2u16.to_be_bytes()),
             Response::Exists(exists) => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u8>());
-                d.extend_from_slice(&3u16.to_be_bytes());
-                d.extend_from_slice(&[if *exists { 1 } else { 0 }]);
-                d
+                buffer.extend_from_slice(&3u16.to_be_bytes());
+                buffer.extend_from_slice(&[if *exists { 1 } else { 0 }]);
             }
             Response::Lock(lock) => {
-                let mut d = Vec::with_capacity(2 * size_of::<u16>());
-                d.extend_from_slice(&4u16.to_be_bytes()); // type
-                d.extend_from_slice(&(*lock as u16).to_be_bytes()); // lock
-                d
+                buffer.extend_from_slice(&4u16.to_be_bytes()); // type
+                buffer.extend_from_slice(&(*lock as u16).to_be_bytes()); // lock
             }
             Response::Get(data) => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + data.len());
-                d.extend_from_slice(&5u16.to_be_bytes());
-                d.extend_from_slice(data);
-                d
+                buffer.extend_from_slice(&5u16.to_be_bytes());
+                buffer.extend_from_slice(data);
             }
-            Response::Put => 6u16.to_be_bytes().to_vec(),
+            Response::Put => buffer.extend_from_slice(&6u16.to_be_bytes()),
             Response::Size(len) => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u8>());
-                d.extend_from_slice(&7u16.to_be_bytes());
-                d.extend_from_slice(&len.to_be_bytes());
-                d
+                buffer.extend_from_slice(&7u16.to_be_bytes());
+                buffer.extend_from_slice(&len.to_be_bytes());
             }
-            Response::Truncate => 8u16.to_be_bytes().to_vec(),
+            Response::Truncate => buffer.extend_from_slice(&8u16.to_be_bytes()),
             Response::Reserved(reserved) => {
-                let mut d = Vec::with_capacity(size_of::<u16>() + size_of::<u8>());
-                d.extend_from_slice(&9u16.to_be_bytes());
-                d.extend_from_slice(&[if *reserved { 1 } else { 0 }]);
-                d
+                buffer.extend_from_slice(&9u16.to_be_bytes());
+                buffer.extend_from_slice(&[if *reserved { 1 } else { 0 }]);
             }
-            Response::Denied => 10u16.to_be_bytes().to_vec(),
+            Response::Denied => buffer.extend_from_slice(&10u16.to_be_bytes()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::connection::{Decode, Encode};
     use crate::request::Lock;
     use crate::response::Response;
 
     #[test]
     fn test_response_open_encode_decode() {
         let res = Response::Open;
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_delete_encode_decode() {
         let res = Response::Delete;
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_exists_encode_decode() {
         let res = Response::Exists(true);
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_lock_encode_decode() {
         let res = Response::Lock(Lock::Pending);
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_get_encode_decode() {
-        let res = Response::Get(std::iter::successors(Some(0u8), |n| n.checked_add(1)).collect());
-        let encoded = res.encode();
+        let data: Vec<u8> = std::iter::successors(Some(0u8), |n| n.checked_add(1)).collect();
+        let res = Response::Get(&data);
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_put_encode_decode() {
         let res = Response::Put;
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_size_encode_decode() {
         let res = Response::Size(42);
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_truncate_encode_decode() {
         let res = Response::Truncate;
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_reserved_encode_decode() {
         let res = Response::Reserved(true);
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 
     #[test]
     fn test_response_denied_encode_decode() {
         let res = Response::Denied;
-        let encoded = res.encode();
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);
     }
 }

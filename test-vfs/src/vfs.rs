@@ -67,7 +67,7 @@ impl sqlite_vfs::DatabaseHandle for Connection {
     fn read_exact_at(&self, mut buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
         let mut client = self.client.lock().unwrap();
         let data = client.get(offset..(offset + buf.len() as u64))?;
-        buf.write_all(&data)?;
+        buf.write_all(data)?;
         if data.len() < buf.len() {
             return Err(ErrorKind::UnexpectedEof.into());
         }
@@ -77,7 +77,7 @@ impl sqlite_vfs::DatabaseHandle for Connection {
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
         let mut client = self.client.lock().unwrap();
-        client.put(offset, buf.to_vec())
+        client.put(offset, buf)
     }
 
     fn sync(&mut self, _data_only: bool) -> Result<(), std::io::Error> {

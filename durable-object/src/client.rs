@@ -7,7 +7,7 @@ use crate::request::{Lock, OpenAccess, Request};
 use crate::response::Response;
 
 pub struct Client {
-    conn: Connection<Request, Response>,
+    conn: Connection,
 }
 
 impl Client {
@@ -15,10 +15,7 @@ impl Client {
         let mut client = Client {
             conn: Connection::new(TcpStream::connect(addr)?),
         };
-        let res = client.send(Request::Open {
-            access,
-            db: db.to_string(),
-        })?;
+        let res = client.send(Request::Open { access, db })?;
         match res {
             Response::Open => Ok(client),
             Response::Denied => Err(ErrorKind::PermissionDenied.into()),
@@ -33,7 +30,7 @@ impl Client {
         let mut client = Client {
             conn: Connection::new(TcpStream::connect(addr)?),
         };
-        let res = client.send(Request::Delete { db: db.to_string() })?;
+        let res = client.send(Request::Delete { db })?;
         if res != Response::Delete {
             return Err(io::Error::new(
                 ErrorKind::Other,
@@ -48,7 +45,7 @@ impl Client {
         let mut client = Client {
             conn: Connection::new(TcpStream::connect(addr)?),
         };
-        let res = client.send(Request::Exists { db: db.to_string() })?;
+        let res = client.send(Request::Exists { db })?;
         if let Response::Exists(exists) = res {
             Ok(exists)
         } else {
@@ -71,7 +68,7 @@ impl Client {
         }
     }
 
-    pub fn get(&mut self, src: Range<u64>) -> io::Result<Vec<u8>> {
+    pub fn get(&mut self, src: Range<u64>) -> io::Result<&[u8]> {
         let res = self.send(Request::Get { src })?;
         if let Response::Get(data) = res {
             Ok(data)
@@ -83,7 +80,7 @@ impl Client {
         }
     }
 
-    pub fn put(&mut self, dst: u64, data: Vec<u8>) -> io::Result<()> {
+    pub fn put(&mut self, dst: u64, data: &[u8]) -> io::Result<()> {
         let res = self.send(Request::Put { dst, data })?;
         if res != Response::Put {
             return Err(io::Error::new(
@@ -132,12 +129,15 @@ impl Client {
     }
 
     fn send(&mut self, req: Request) -> io::Result<Response> {
-        self.conn.send(req)?;
+        self.conn.send(|data: &mut Vec<u8>| req.encode(data))?;
+        log::trace!("sent {:?}", req);
 
         let res = self
             .conn
             .receive()?
             .ok_or_else(|| io::Error::new(ErrorKind::Interrupted, "connection got closed"))?;
+        let res = Response::decode(res)?;
+        log::trace!("received {:?}", res);
 
         Ok(res)
     }
