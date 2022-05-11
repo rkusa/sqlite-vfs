@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use durable_object::client::Client;
-use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs};
+use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs, WalIndex, WalIndexLock};
 
 /// [Vfs] test implementation based on Rust's [std::fs:File]. This implementation is not meant for
 /// any use-cases except running SQLite unit tests, as the locking is only managed in process
@@ -17,6 +19,8 @@ pub struct Connection {
     client: Mutex<Client>,
     lock: Lock,
 }
+
+pub struct WalConnection;
 
 impl Vfs for TestVfs {
     type Handle = Connection;
@@ -56,9 +60,31 @@ impl Vfs for TestVfs {
             .to_string_lossy()
             .to_string()
     }
+
+    fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
+        let path = Path::new(&db);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let path = normalize_path(&path);
+        Ok(path
+            .to_str()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::Other,
+                    "cannot convert canoicalized path to string",
+                )
+            })?
+            .to_string()
+            .into())
+    }
 }
 
 impl sqlite_vfs::DatabaseHandle for Connection {
+    type WalIndex = WalConnection;
+
     fn size(&self) -> Result<u64, std::io::Error> {
         let mut client = self.client.lock().unwrap();
         client.size()
@@ -133,4 +159,81 @@ impl sqlite_vfs::DatabaseHandle for Connection {
     fn current_lock(&self) -> Result<Lock, std::io::Error> {
         Ok(self.lock)
     }
+}
+
+impl WalIndex<Connection> for WalConnection {
+    fn map(_handle: &mut Connection, _region: u32) -> Result<[u8; 32768], std::io::Error> {
+        Ok([0; 32768])
+    }
+
+    fn lock(
+        handle: &mut Connection,
+        locks: std::ops::Range<u8>,
+        lock: WalIndexLock,
+    ) -> Result<bool, std::io::Error> {
+        let mut client = handle.client.lock().unwrap();
+        client.lock_wal_index(
+            locks,
+            match lock {
+                WalIndexLock::None => durable_object::request::WalIndexLock::None,
+                WalIndexLock::Shared => durable_object::request::WalIndexLock::Shared,
+                WalIndexLock::Exclusive => durable_object::request::WalIndexLock::Exclusive,
+            },
+        )
+    }
+
+    fn delete(handle: &mut Connection) -> Result<(), std::io::Error> {
+        let mut client = handle.client.lock().unwrap();
+        client.delete_wal_index()
+    }
+
+    fn pull(
+        handle: &mut Connection,
+        region: u32,
+        data: &mut [u8; 32768],
+    ) -> Result<(), std::io::Error> {
+        let mut client = handle.client.lock().unwrap();
+        let new_data = client.get_wal_index(region)?;
+        data.copy_from_slice(&new_data[..]);
+        Ok(())
+    }
+
+    fn push(
+        handle: &mut Connection,
+        region: u32,
+        data: &[u8; 32768],
+    ) -> Result<(), std::io::Error> {
+        let mut client = handle.client.lock().unwrap();
+        client.put_wal_index(region, data)
+    }
+}
+
+// Source: https://github.com/rust-lang/cargo/blob/7a3b56b4860c0e58dab815549a93198a1c335b64/crates/cargo-util/src/paths.rs#L81
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
 }

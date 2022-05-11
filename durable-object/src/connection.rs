@@ -58,7 +58,6 @@ impl Connection {
             }
 
             let msg_len = u32::from_be_bytes(self.recv_buffer[0..4].try_into().unwrap()) as usize;
-            log::trace!("msg_len={}", msg_len);
             if msg_len > self.recv_buffer.len() {
                 self.recv_buffer.resize(msg_len, 0);
                 continue;

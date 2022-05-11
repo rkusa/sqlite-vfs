@@ -2,10 +2,14 @@
 //! Create a custom SQLite virtual file system by implementing the [Vfs] trait and registering it
 //! using [register].
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::io::ErrorKind;
 use std::mem::{size_of, ManuallyDrop, MaybeUninit};
+use std::ops::Range;
 use std::os::raw::{c_char, c_int};
+use std::pin::Pin;
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
@@ -16,7 +20,13 @@ use std::time::Instant;
 mod ffi;
 
 /// A file opened by [Vfs].
-pub trait DatabaseHandle {
+pub trait DatabaseHandle
+where
+    Self: Sized,
+{
+    /// An optional trait used to store a WAL (write-ahead log).
+    type WalIndex: WalIndex<Self>;
+
     /// Return the current size in bytes of the database.
     fn size(&self) -> Result<u64, std::io::Error>;
 
@@ -78,6 +88,29 @@ pub trait Vfs {
     /// Check access to `db`. The default implementation always returns `true`.
     fn access(&self, _db: &str, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
+    }
+
+    /// Retrieve the full pathname of a database `db`.
+    fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
+        Ok(db.into())
+    }
+}
+
+pub trait WalIndex<T> {
+    fn enabled() -> bool {
+        true
+    }
+
+    fn map(handle: &mut T, region: u32) -> Result<[u8; 32768], std::io::Error>;
+    fn lock(handle: &mut T, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, std::io::Error>;
+    fn delete(handle: &mut T) -> Result<(), std::io::Error>;
+
+    fn pull(_handle: &mut T, _region: u32, _data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+
+    fn push(_handle: &mut T, _region: u32, _data: &[u8; 32768]) -> Result<(), std::io::Error> {
+        Ok(())
     }
 }
 
@@ -159,11 +192,20 @@ pub enum Lock {
     Exclusive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u16)]
+pub enum WalIndexLock {
+    None = 1,
+    Shared,
+    Exclusive,
+}
+
 struct State<V> {
     name: CString,
     vfs: Arc<V>,
     io_methods: ffi::sqlite3_io_methods,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
+    next_id: usize,
 }
 
 /// Register a virtual file system ([Vfs]) to SQLite.
@@ -186,12 +228,12 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xFileControl: Some(io::file_control::<V, F>),
         xSectorSize: Some(io::sector_size::<F>),
         xDeviceCharacteristics: Some(io::device_characteristics::<F>),
-        xShmMap: Some(io::shm_map::<F>),
-        xShmLock: Some(io::shm_lock::<F>),
-        xShmBarrier: Some(io::shm_barrier),
-        xShmUnmap: Some(io::shm_unmap::<F>),
-        xFetch: Some(io::mem_fetch::<F>),
-        xUnfetch: Some(io::mem_unfetch::<F>),
+        xShmMap: Some(io::shm_map::<V, F>),
+        xShmLock: Some(io::shm_lock::<V, F>),
+        xShmBarrier: Some(io::shm_barrier::<V, F>),
+        xShmUnmap: Some(io::shm_unmap::<V, F>),
+        xFetch: Some(io::mem_fetch::<V, F>),
+        xUnfetch: Some(io::mem_unfetch::<V, F>),
     };
     let name = CString::new(name)?;
     let name_ptr = name.as_ptr();
@@ -200,6 +242,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         vfs: Arc::new(vfs),
         io_methods,
         last_error: Default::default(),
+        next_id: 0,
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
         iVersion: 3,
@@ -253,6 +296,9 @@ struct FileExt<V, F> {
     file: F,
     delete_on_close: bool,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
+    wal_index: HashMap<u32, Pin<Box<[u8; 32768]>>>,
+    wal_index_locks: HashMap<u8, WalIndexLock>,
+    id: usize,
 }
 
 // Example mem-fs implementation:
@@ -351,7 +397,11 @@ mod vfs {
             file,
             delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
+            wal_index: Default::default(),
+            wal_index_locks: Default::default(),
+            id: state.next_id,
         });
+        state.next_id = state.next_id.overflowing_add(1).0;
 
         ffi::SQLITE_OK
     }
@@ -363,21 +413,14 @@ mod vfs {
         z_path: *const c_char,
         _sync_dir: c_int,
     ) -> c_int {
-        let name = if z_path.is_null() {
-            None
-        } else {
-            CStr::from_ptr(z_path).to_str().ok()
-        };
-        log::trace!("delete z_name={:?}", name);
+        let path = CStr::from_ptr(z_path);
+        let path = path.to_string_lossy().to_string();
+        log::trace!("delete name={:?}", path);
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_DELETE,
         };
-
-        let path = CStr::from_ptr(z_path);
-        // TODO: any way to use OsStr instead?
-        let path = path.to_string_lossy().to_string();
 
         match state.vfs.delete(path.as_ref()) {
             Ok(_) => ffi::SQLITE_OK,
@@ -436,18 +479,34 @@ mod vfs {
     /// Populate buffer `z_out` with the full canonical pathname corresponding to the pathname in
     /// `z_path`. `z_out` is guaranteed to point to a buffer of at least (INST_MAX_PATHNAME+1)
     /// bytes.
-    pub unsafe extern "C" fn full_pathname<V>(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+    pub unsafe extern "C" fn full_pathname<V: Vfs>(
+        p_vfs: *mut ffi::sqlite3_vfs,
         z_path: *const c_char,
         n_out: c_int,
         z_out: *mut c_char,
     ) -> c_int {
-        let name = CStr::from_ptr(z_path);
-        log::trace!("full_pathname name={}", name.to_string_lossy());
+        let name = CStr::from_ptr(z_path).to_string_lossy();
+        log::trace!("full_pathname name={}", name);
+
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+        let name = match state.vfs.full_pathname(&name).and_then(|name| {
+            CString::new(name.to_string()).map_err(|_| {
+                std::io::Error::new(ErrorKind::Other, "name must not contain a nul byte")
+            })
+        }) {
+            Ok(name) => name,
+            Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, err),
+        };
 
         let name = name.to_bytes_with_nul();
         if name.len() > n_out as usize || name.len() > MAX_PATH_LENGTH {
-            return ffi::SQLITE_ERROR;
+            return state.set_last_error(
+                ffi::SQLITE_ERROR,
+                std::io::Error::new(ErrorKind::Other, "full pathname is too long"),
+            );
         }
         let out = slice::from_raw_parts_mut(z_out as *mut u8, name.len());
         out.copy_from_slice(name);
@@ -578,6 +637,7 @@ mod vfs {
 }
 
 mod io {
+    use std::collections::hash_map::Entry;
     use std::mem;
 
     use super::*;
@@ -594,7 +654,7 @@ mod io {
 
             let ext = mem::replace(&mut f.ext, MaybeUninit::uninit());
             let ext = ext.assume_init(); // extract the value to drop it
-            log::trace!("close ({})", ext.db_name);
+            log::trace!("[{}] close ({})", ext.id, ext.db_name);
         }
 
         ffi::SQLITE_OK
@@ -611,7 +671,13 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CLOSE,
         };
-        log::trace!("read offset={} len={} ({})", i_ofst, i_amt, state.db_name);
+        log::trace!(
+            "[{}] read offset={} len={} ({})",
+            state.id,
+            i_ofst,
+            i_amt,
+            state.db_name
+        );
 
         let out = slice::from_raw_parts_mut(z_buf as *mut u8, i_amt as usize);
         if let Err(err) = state.file.read_exact_at(out, i_ofst as u64) {
@@ -637,7 +703,13 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_WRITE,
         };
-        log::trace!("write offset={} len={} ({})", i_ofst, i_amt, state.db_name);
+        log::trace!(
+            "[{}] write offset={} len={} ({})",
+            state.id,
+            i_ofst,
+            i_amt,
+            state.db_name
+        );
 
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
         if let Err(err) = state.file.write_all_at(data, i_ofst as u64) {
@@ -656,7 +728,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("truncate ({})", state.db_name);
+        log::trace!("[{}] truncate ({})", state.id, state.db_name);
 
         if let Err(err) = state.file.truncate(size as u64) {
             return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
@@ -674,7 +746,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("sync ({})", state.db_name);
+        log::trace!("[{}] sync ({})", state.id, state.db_name);
 
         #[cfg(feature = "sqlite_test")]
         {
@@ -701,7 +773,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSTAT,
         };
-        log::trace!("file_size ({})", state.db_name);
+        log::trace!("[{}] file_size ({})", state.id, state.db_name);
 
         if let Err(err) = state.file.size().and_then(|n| {
             let p_size: &mut ffi::sqlite3_int64 = p_size.as_mut().ok_or_else(null_ptr_error)?;
@@ -723,15 +795,26 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_LOCK,
         };
-        log::trace!("lock ({})", state.db_name);
+        log::trace!("[{}] lock ({})", state.id, state.db_name);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
             None => return ffi::SQLITE_IOERR_LOCK,
         };
         match state.file.lock(lock) {
-            Ok(true) => ffi::SQLITE_OK,
-            Ok(false) => ffi::SQLITE_BUSY,
+            Ok(true) => {
+                log::trace!("[{}] lock={:?} ({})", state.id, lock, state.db_name);
+                ffi::SQLITE_OK
+            }
+            Ok(false) => {
+                log::trace!(
+                    "[{}] busy (denied {:?}) ({})",
+                    state.id,
+                    lock,
+                    state.db_name
+                );
+                ffi::SQLITE_BUSY
+            }
             Err(err) => state.set_last_error(ffi::SQLITE_IOERR_LOCK, err),
         }
     }
@@ -745,14 +828,17 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_UNLOCK,
         };
-        log::trace!("unlock ({})", state.db_name);
+        log::trace!("[{}] unlock ({})", state.id, state.db_name);
 
         let lock = match Lock::from_i32(e_lock) {
             Some(lock) => lock,
             None => return ffi::SQLITE_IOERR_UNLOCK,
         };
         match state.file.unlock(lock) {
-            Ok(true) => ffi::SQLITE_OK,
+            Ok(true) => {
+                log::trace!("[{}] unlock={:?} ({})", state.id, lock, state.db_name);
+                ffi::SQLITE_OK
+            }
             Ok(false) => ffi::SQLITE_BUSY,
             Err(err) => state.set_last_error(ffi::SQLITE_IOERR_UNLOCK, err),
         }
@@ -767,7 +853,7 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
-        log::trace!("check_reserved_lock ({})", state.db_name);
+        log::trace!("[{}] check_reserved_lock ({})", state.id, state.db_name);
 
         if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
@@ -786,12 +872,11 @@ mod io {
         op: c_int,
         p_arg: *mut c_void,
     ) -> c_int {
-        log::trace!("file_control op={}", op);
-
         let state = match file_state::<V, F>(p_file) {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_NOTFOUND,
         };
+        log::trace!("[{}] file_control op={} ({})", state.id, op, state.db_name);
 
         // eprintln!("file_control: {}", op);
 
@@ -971,12 +1056,12 @@ mod io {
 
             // Invoked from within a checkpoint in wal mode after the client has finished copying
             // pages from the wal file to the database file, but before the *-shm file is updated to
-            // record the fact that the pages have been checkpointed. Not implemented.
-            ffi::SQLITE_FCNTL_CKPT_DONE => ffi::SQLITE_NOTFOUND,
+            // record the fact that the pages have been checkpointed. Silently ignored.
+            ffi::SQLITE_FCNTL_CKPT_DONE => ffi::SQLITE_OK,
 
             // Invoked from within a checkpoint in wal mode before the client starts to copy pages
-            // from the wal file to the database file. Not implemented.
-            ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_NOTFOUND,
+            // from the wal file to the database file. Silently ignored.
+            ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
 
             _ => ffi::SQLITE_NOTFOUND,
             // The following op codes are mentioned in the docs but are not defined in ffi::*:
@@ -1012,64 +1097,248 @@ mod io {
     }
 
     /// Create a shared memory file mapping.
-    pub unsafe extern "C" fn shm_map<F>(
-        _p_file: *mut ffi::sqlite3_file,
-        i_pg: i32,
-        pgsz: i32,
+    pub unsafe extern "C" fn shm_map<V, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+        region_ix: i32,
+        region_size: i32,
         b_extend: i32,
-        _pp: *mut *mut c_void,
+        pp: *mut *mut c_void,
     ) -> i32 {
-        log::trace!("shm_map pg={} sz={} extend={}", i_pg, pgsz, b_extend);
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+        log::trace!(
+            "[{}] shm_map pg={} sz={} extend={} ({})",
+            state.id,
+            region_ix,
+            region_size,
+            b_extend,
+            state.db_name
+        );
 
-        ffi::SQLITE_IOERR_SHMMAP
-    }
+        if !F::WalIndex::enabled() {
+            return ffi::SQLITE_IOERR_SHMLOCK;
+        }
 
-    /// Perform locking on a shared-memory segment.
-    pub unsafe extern "C" fn shm_lock<F>(
-        _p_file: *mut ffi::sqlite3_file,
-        _offset: i32,
-        _n: i32,
-        _flags: i32,
-    ) -> i32 {
-        log::trace!("shm_lock");
+        if region_size != 32768 {
+            return state.set_last_error(
+                ffi::SQLITE_IOERR_SHMMAP,
+                std::io::Error::new(
+                    ErrorKind::Other,
+                    format!(
+                        "encountered region size other than 32kB; got {}",
+                        region_size
+                    ),
+                ),
+            );
+        }
 
-        ffi::SQLITE_IOERR_SHMLOCK
-    }
-
-    /// Memory barrier operation on shared memory.
-    pub unsafe extern "C" fn shm_barrier(_p_file: *mut ffi::sqlite3_file) {
-        log::trace!("shm_barrier");
-    }
-
-    /// Unmap a shared memory segment.
-    pub unsafe extern "C" fn shm_unmap<F>(
-        _p_file: *mut ffi::sqlite3_file,
-        _delete_flags: i32,
-    ) -> i32 {
-        log::trace!("shm_unmap");
+        let entry = state.wal_index.entry(region_ix as u32);
+        match entry {
+            Entry::Occupied(mut entry) => {
+                *pp = entry.get_mut().as_mut_ptr() as *mut c_void;
+            }
+            Entry::Vacant(entry) => {
+                let m = match F::WalIndex::map(&mut state.file, region_ix as u32) {
+                    Ok(m) => Box::pin(m),
+                    Err(err) => {
+                        return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
+                    }
+                };
+                let m = entry.insert(m);
+                *pp = m.as_mut_ptr() as *mut c_void;
+            }
+        }
 
         ffi::SQLITE_OK
     }
 
+    /// Perform locking on a shared-memory segment.
+    pub unsafe extern "C" fn shm_lock<V, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+        offset: i32,
+        n: i32,
+        flags: i32,
+    ) -> i32 {
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+        let locking = flags & ffi::SQLITE_SHM_LOCK > 0;
+        let exclusive = flags & ffi::SQLITE_SHM_EXCLUSIVE > 0;
+        log::trace!(
+            "[{}] shm_lock offset={} n={} lock={} exclusive={} (flags={}) ({})",
+            state.id,
+            offset,
+            n,
+            locking,
+            exclusive,
+            flags,
+            state.db_name
+        );
+
+        let range = offset as u8..(offset + n) as u8;
+        let lock = match (locking, exclusive) {
+            (true, true) => WalIndexLock::Exclusive,
+            (true, false) => WalIndexLock::Shared,
+            (false, _) => WalIndexLock::None,
+        };
+
+        if locking {
+            let has_exclusive = state
+                .wal_index_locks
+                .iter()
+                .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+
+            if !has_exclusive {
+                log::trace!(
+                    "[{}] does not have wal index write lock, pulling changes",
+                    state.id
+                );
+                for (region, data) in &mut state.wal_index {
+                    if let Err(err) = F::WalIndex::pull(&mut state.file, *region as u32, data) {
+                        return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
+                    }
+                }
+            }
+        } else {
+            // // determine whether the connection has an exclusive lock before this action
+            // let has_exclusive_before = state
+            //     .wal_index_locks
+            //     .iter()
+            //     .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+
+            // // determine whether the connection still has an exclusive lock after this action
+            // let has_exclusive_after = state
+            //     .wal_index_locks
+            //     .iter()
+            //     .any(|(region, lock)| *lock == WalIndexLock::Exclusive && !range.contains(region));
+
+            let releases_any_exclusive = state
+                .wal_index_locks
+                .iter()
+                .any(|(region, lock)| *lock == WalIndexLock::Exclusive && range.contains(region));
+
+            // push index changes when moving from any exclusive lock to no exlusive locks
+            if releases_any_exclusive {
+                log::trace!(
+                    "[{}] releasing an exclusive lock, pushing wal index changes",
+                    state.id,
+                );
+                for (region, data) in &mut state.wal_index {
+                    if let Err(err) = F::WalIndex::push(&mut state.file, *region as u32, data) {
+                        return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
+                    }
+                }
+            }
+        }
+
+        match F::WalIndex::lock(&mut state.file, range.clone(), lock) {
+            Ok(true) => {
+                for region in range {
+                    state.wal_index_locks.insert(region, lock);
+                }
+                ffi::SQLITE_OK
+            }
+            Ok(false) => ffi::SQLITE_BUSY,
+            Err(err) => state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err),
+        }
+    }
+
+    /// Memory barrier operation on shared memory.
+    pub unsafe extern "C" fn shm_barrier<V, F: DatabaseHandle>(p_file: *mut ffi::sqlite3_file) {
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        log::trace!("[{}] shm_barrier ({})", state.id, state.db_name);
+
+        let has_exclusive = state
+            .wal_index_locks
+            .iter()
+            .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+
+        if !has_exclusive {
+            log::trace!(
+                "[{}] does not have wal index write lock, pulling changes",
+                state.id
+            );
+            for (region, data) in &mut state.wal_index {
+                if let Err(err) = F::WalIndex::pull(&mut state.file, *region as u32, data) {
+                    log::error!("[{}] pulling wal index changes failed: {}", state.id, err)
+                }
+            }
+        }
+    }
+
+    /// Unmap a shared memory segment.
+    pub unsafe extern "C" fn shm_unmap<V, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+        delete_flags: i32,
+    ) -> i32 {
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+        log::trace!(
+            "[{}] shm_unmap delete={} ({})",
+            state.id,
+            delete_flags == 1,
+            state.db_name
+        );
+
+        state.wal_index.clear();
+        state.wal_index_locks.clear();
+
+        if delete_flags == 1 {
+            match F::WalIndex::delete(&mut state.file) {
+                Ok(()) => ffi::SQLITE_OK,
+                Err(err) => state.set_last_error(ffi::SQLITE_ERROR, err),
+            }
+        } else {
+            ffi::SQLITE_OK
+        }
+    }
+
     /// Fetch a page of a memory-mapped file.
-    pub unsafe extern "C" fn mem_fetch<F: DatabaseHandle>(
-        _p_file: *mut ffi::sqlite3_file,
+    pub unsafe extern "C" fn mem_fetch<V, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
         i_ofst: i64,
         i_amt: i32,
         _pp: *mut *mut c_void,
     ) -> i32 {
-        log::trace!("mem_fetch offset={} len={}", i_ofst, i_amt);
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+        log::trace!(
+            "[{}] mem_fetch offset={} len={} ({})",
+            state.id,
+            i_ofst,
+            i_amt,
+            state.db_name
+        );
 
         ffi::SQLITE_ERROR
     }
 
     /// Release a memory-mapped page.
-    pub unsafe extern "C" fn mem_unfetch<F>(
-        _p_file: *mut ffi::sqlite3_file,
+    pub unsafe extern "C" fn mem_unfetch<V, F>(
+        p_file: *mut ffi::sqlite3_file,
         i_ofst: i64,
         _p_page: *mut c_void,
     ) -> i32 {
-        log::trace!("mem_unfetch offset={}", i_ofst);
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+        log::trace!(
+            "[{}] mem_unfetch offset={} ({})",
+            state.id,
+            i_ofst,
+            state.db_name
+        );
 
         ffi::SQLITE_OK
     }
@@ -1222,6 +1491,31 @@ impl PartialOrd for Lock {
 impl Default for Lock {
     fn default() -> Self {
         Self::None
+    }
+}
+
+#[derive(Default)]
+pub struct WalDisabled;
+
+impl<T> WalIndex<T> for WalDisabled {
+    fn enabled() -> bool {
+        false
+    }
+
+    fn map(_handle: &mut T, _region: u32) -> Result<[u8; 32768], std::io::Error> {
+        Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
+    }
+
+    fn lock(
+        _handle: &mut T,
+        _locks: Range<u8>,
+        _lock: WalIndexLock,
+    ) -> Result<bool, std::io::Error> {
+        Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
+    }
+
+    fn delete(_handle: &mut T) -> Result<(), std::io::Error> {
+        Ok(())
     }
 }
 

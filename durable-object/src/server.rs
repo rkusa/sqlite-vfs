@@ -1,33 +1,40 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::connection::Connection;
-use crate::request::OpenAccess;
+use crate::request::{OpenAccess, WalIndexLock};
 
 use super::request::{Lock, Request};
 use super::response::Response;
 
 #[derive(Default)]
 pub struct Server {
+    next_id: AtomicUsize,
     #[allow(clippy::type_complexity)]
-    file_locks: Arc<RwLock<HashMap<PathBuf, Arc<RwLock<FileLock>>>>>,
+    file_locks: Arc<RwLock<HashMap<PathBuf, Weak<RwLock<FileLockState>>>>>,
+    #[allow(clippy::type_complexity)]
+    wal_indices: Arc<RwLock<HashMap<PathBuf, Weak<Mutex<WalIndex>>>>>,
 }
 
 pub struct FileConnection {
+    id: usize,
     path: PathBuf,
     file: File,
-    file_lock: Arc<RwLock<FileLock>>,
+    file_lock: Arc<RwLock<FileLockState>>,
     conn_lock: Lock,
     buffer: Vec<u8>,
+    wal_index: Arc<Mutex<WalIndex>>,
+    wal_index_lock: HashMap<u8, WalIndexLock>,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum FileLock {
+enum FileLockState {
     /// The object is shared for reading between `count` locks.
     Read { count: usize },
     /// The object has [Lock::Reserved] lock, so new and existing read locks are still allowed, just
@@ -40,7 +47,22 @@ enum FileLock {
     Exclusive,
 }
 
-struct ServerConnection(Connection);
+#[derive(Default)]
+struct WalIndex {
+    data: HashMap<u32, [u8; 32768]>,
+    locks: HashMap<u8, WalIndexLockState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WalIndexLockState {
+    Shared { count: usize },
+    Exclusive,
+}
+
+struct ServerConnection {
+    id: usize,
+    inner: Connection,
+}
 
 impl Server {
     pub fn start(self, addr: impl ToSocketAddrs) -> io::Result<()> {
@@ -71,14 +93,56 @@ impl Server {
     }
 
     fn handle_client(self: Arc<Server>, stream: TcpStream) -> io::Result<()> {
-        let mut conn = ServerConnection(Connection::new(stream));
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut conn = ServerConnection {
+            id,
+            inner: Connection::new(stream),
+        };
 
         match conn.receive()? {
             Some(Request::Open { access, db }) => {
                 let path = normalize_path(Path::new(&db));
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
-                    objects.entry(path.clone()).or_default().clone()
+                    match objects.entry(path.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            let w = entry.get();
+                            if let Some(a) = w.upgrade() {
+                                a
+                            } else {
+                                let a: Arc<_> = Default::default();
+                                entry.insert(Arc::downgrade(&a));
+                                a
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            let a: Arc<_> = Default::default();
+                            entry.insert(Arc::downgrade(&a));
+                            a
+                        }
+                    }
+                };
+                let wal_index = {
+                    let mut objects = self.wal_indices.write().unwrap();
+                    match objects.entry(path.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            let w = entry.get();
+                            if let Some(a) = w.upgrade() {
+                                a
+                            } else {
+                                let a: Arc<_> = Default::default();
+                                entry.insert(Arc::downgrade(&a));
+                                a
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            let a: Arc<_> = Default::default();
+                            entry.insert(Arc::downgrade(&a));
+                            a
+                        }
+                    }
                 };
 
                 let mut o = fs::OpenOptions::new();
@@ -104,7 +168,7 @@ impl Server {
                     }
                 };
 
-                FileConnection::handle(conn, path, f, file_lock)?;
+                FileConnection::handle(conn, id, path, f, file_lock, wal_index)?;
                 Ok(())
             }
             Some(Request::Delete { db }) => {
@@ -131,11 +195,11 @@ impl Server {
 
 impl ServerConnection {
     fn receive(&mut self) -> io::Result<Option<Request>> {
-        let res = self.0.receive()?;
+        let res = self.inner.receive()?;
         match res {
             Some(res) => {
                 let res = Request::decode(res)?;
-                log::trace!("received {:?}", res);
+                log::trace!("{{{}}} received {:?}", self.id, res);
                 Ok(Some(res))
             }
             None => Ok(None),
@@ -143,8 +207,8 @@ impl ServerConnection {
     }
 
     fn send(&mut self, req: Response) -> io::Result<()> {
-        self.0.send(|data: &mut Vec<u8>| req.encode(data))?;
-        log::trace!("sent {:?}", req);
+        self.inner.send(|data: &mut Vec<u8>| req.encode(data))?;
+        log::trace!("{{{}}} sent {:?}", self.id, req);
         Ok(())
     }
 }
@@ -152,16 +216,21 @@ impl ServerConnection {
 impl FileConnection {
     fn handle(
         mut conn: ServerConnection,
+        id: usize,
         path: PathBuf,
         file: File,
-        file_lock: Arc<RwLock<FileLock>>,
+        file_lock: Arc<RwLock<FileLockState>>,
+        wal_index: Arc<Mutex<WalIndex>>,
     ) -> io::Result<()> {
         let mut file_conn = Self {
+            id,
             path,
             file,
             file_lock,
             conn_lock: Lock::None,
             buffer: Vec::with_capacity(4096),
+            wal_index,
+            wal_index_lock: Default::default(),
         };
 
         while let Some(req) = conn.receive()? {
@@ -179,17 +248,24 @@ impl FileConnection {
             }
             Request::Lock { lock: to } => {
                 log::debug!(
-                    "request lock {:?} -> {:?} @ {:?} ({:?})",
+                    "{{{}}} request lock {:?} -> {:?} @ {:?} ({:?})",
+                    self.id,
                     self.conn_lock,
                     to,
                     self.file_lock.read().unwrap(),
                     self.path,
                 );
                 if self.lock(to)? {
-                    log::debug!("lock {:?} granted ({:?})", self.conn_lock, self.path);
+                    log::debug!(
+                        "{{{}}} lock {:?} granted @ {:?} ({:?})",
+                        self.id,
+                        self.conn_lock,
+                        self.file_lock.read().unwrap(),
+                        self.path
+                    );
                     Ok(Response::Lock(self.conn_lock))
                 } else {
-                    log::debug!("lock {:?} denied ({:?})", to, self.path);
+                    log::debug!("{{{}}} lock {:?} denied ({:?})", self.id, to, self.path);
                     Ok(Response::Denied)
                 }
             }
@@ -228,8 +304,77 @@ impl FileConnection {
                 let file_lock = self.file_lock.read().unwrap();
                 Ok(Response::Reserved(matches!(
                     &*file_lock,
-                    FileLock::Pending { .. } | FileLock::Reserved { .. } | FileLock::Exclusive
+                    FileLockState::Pending { .. }
+                        | FileLockState::Reserved { .. }
+                        | FileLockState::Exclusive
                 )))
+            }
+            Request::GetWalIndex { region } => {
+                let mut wal_index = self.wal_index.lock().unwrap();
+                // let has_exclusive_lock = wal_index
+                //     .locks
+                //     .iter()
+                //     .any(|(_, lock)| *lock == WalIndexLockState::Exclusive);
+                // if has_exclusive_lock {
+                //     log::debug!("{{{}}} awaiting release of exclusive locks", self.id);
+                //     // TODO: use channel for notification instead of sleep/polling
+                //     std::thread::sleep(std::time::Duration::from_millis(10));
+                //     continue;
+                // }
+
+                let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
+                self.buffer.resize(32768, 0);
+                (&mut self.buffer[..32768]).copy_from_slice(&data[..]);
+                Ok(Response::GetWalIndex(
+                    (&self.buffer[..32768]).try_into().unwrap(),
+                ))
+            }
+            Request::PutWalIndex { region, data } => {
+                let mut wal_index = self.wal_index.lock().unwrap();
+                if let Some(previous) = wal_index.data.get(&region) {
+                    if previous == data {
+                        // log::error!("{{{}}} unnecessary index write!", self.id);
+                    }
+                }
+                wal_index.data.insert(region, *data);
+                Ok(Response::PutWalIndex)
+            }
+            Request::LockWalIndex { locks, lock: to } => {
+                let mut wal_index = self.wal_index.lock().unwrap();
+
+                // check whether all locks are available
+                for region in locks.clone() {
+                    let current = wal_index.locks.entry(region).or_default();
+                    let from = self.wal_index_lock.entry(region).or_default();
+                    log::debug!(
+                        "{{{}}} region={} transition {:?} from {:?} to {:?}",
+                        self.id,
+                        region,
+                        current,
+                        *from,
+                        to
+                    );
+                    if transition_wal_index_lock(current, *from, to).is_none() {
+                        log::warn!("{{{}}} region={} lock {:?} denied", self.id, region, to);
+                        return Ok(Response::Denied);
+                    }
+                }
+
+                // set all locks
+                for region in locks {
+                    let current = wal_index.locks.entry(region).or_default();
+                    let from = self.wal_index_lock.entry(region).or_default();
+                    *current = transition_wal_index_lock(current, *from, to).unwrap();
+                    *from = to;
+                }
+
+                Ok(Response::LockWalIndex)
+            }
+            Request::DeleteWalIndex => {
+                let mut wal_index = self.wal_index.lock().unwrap();
+                wal_index.data.clear();
+                wal_index.locks.clear();
+                Ok(Response::DeleteWalIndex)
             }
         }
     }
@@ -238,18 +383,28 @@ impl FileConnection {
         let mut file_lock = self.file_lock.write().unwrap();
         match (*file_lock, self.conn_lock, to) {
             // Increment reader count when adding new shared lock.
-            (FileLock::Read { .. } | FileLock::Reserved { .. }, Lock::None, Lock::Shared) => {
+            (
+                FileLockState::Read { .. } | FileLockState::Reserved { .. },
+                Lock::None,
+                Lock::Shared,
+            ) => {
                 file_lock.increment();
                 self.conn_lock = to;
                 Ok(true)
             }
 
             // Don't allow new shared locks when there is a pending or exclusive lock.
-            (FileLock::Pending { .. } | FileLock::Exclusive, Lock::None, Lock::Shared) => Ok(false),
+            (
+                FileLockState::Pending { .. } | FileLockState::Exclusive,
+                Lock::None,
+                Lock::Shared,
+            ) => Ok(false),
 
             // Decrement reader count when removing shared lock.
             (
-                FileLock::Read { .. } | FileLock::Reserved { .. } | FileLock::Pending { .. },
+                FileLockState::Read { .. }
+                | FileLockState::Reserved { .. }
+                | FileLockState::Pending { .. },
                 Lock::Shared,
                 Lock::None,
             ) => {
@@ -259,57 +414,66 @@ impl FileConnection {
             }
 
             // Issue a reserved lock.
-            (FileLock::Read { count }, Lock::Shared, Lock::Reserved) => {
-                *file_lock = FileLock::Reserved { count: count - 1 };
+            (FileLockState::Read { count }, Lock::Shared, Lock::Reserved) => {
+                *file_lock = FileLockState::Reserved { count: count - 1 };
                 self.conn_lock = to;
                 Ok(true)
             }
 
             // Return from reserved or pending to shared lock.
-            (FileLock::Reserved { count }, Lock::Reserved, Lock::Shared)
-            | (FileLock::Pending { count }, Lock::Pending, Lock::Shared) => {
-                *file_lock = FileLock::Read { count: count + 1 };
+            (FileLockState::Reserved { count }, Lock::Reserved, Lock::Shared)
+            | (FileLockState::Pending { count }, Lock::Pending, Lock::Shared) => {
+                *file_lock = FileLockState::Read { count: count + 1 };
                 self.conn_lock = to;
                 Ok(true)
             }
 
-            // Return from reserved to none lock.
-            (FileLock::Reserved { count }, Lock::Reserved, Lock::None) => {
-                *file_lock = FileLock::Read { count };
+            // Return from reserved or pending to none lock.
+            (FileLockState::Reserved { count }, Lock::Reserved, Lock::None)
+            | (FileLockState::Pending { count }, Lock::Pending, Lock::None) => {
+                *file_lock = FileLockState::Read { count };
                 self.conn_lock = to;
                 Ok(true)
             }
 
             // Only a single write lock allowed.
             (
-                FileLock::Reserved { .. } | FileLock::Pending { .. } | FileLock::Exclusive,
+                FileLockState::Reserved { .. }
+                | FileLockState::Pending { .. }
+                | FileLockState::Exclusive,
                 Lock::Shared,
                 Lock::Reserved,
             ) => Ok(false),
 
             // Acquire an exclusive lock.
-            (FileLock::Read { count }, Lock::Shared, Lock::Exclusive)
-            | (FileLock::Reserved { count }, Lock::Reserved, Lock::Exclusive)
-            | (FileLock::Pending { count }, Lock::Pending, Lock::Exclusive) => {
-                if (matches!(&*file_lock, FileLock::Read { .. }) && count == 1) || count == 0 {
-                    *file_lock = FileLock::Exclusive;
+            (FileLockState::Read { count }, Lock::Shared, Lock::Exclusive)
+            | (FileLockState::Reserved { count }, Lock::Reserved, Lock::Exclusive)
+            | (FileLockState::Pending { count }, Lock::Pending, Lock::Exclusive) => {
+                if matches!(&*file_lock, FileLockState::Read { count: 1 }) || count == 0 {
+                    *file_lock = FileLockState::Exclusive;
                     self.conn_lock = Lock::Exclusive;
                     Ok(true)
                 } else {
-                    *file_lock = FileLock::Pending { count };
+                    *file_lock = FileLockState::Pending {
+                        count: if matches!(&*file_lock, FileLockState::Read { .. }) {
+                            count - 1 // remove itself
+                        } else {
+                            count
+                        },
+                    };
                     self.conn_lock = Lock::Pending;
                     Ok(true)
                 }
             }
 
             // Stop writing.
-            (FileLock::Exclusive, Lock::Exclusive, Lock::Shared) => {
-                *file_lock = FileLock::Read { count: 1 };
+            (FileLockState::Exclusive, Lock::Exclusive, Lock::Shared) => {
+                *file_lock = FileLockState::Read { count: 1 };
                 self.conn_lock = to;
                 Ok(true)
             }
-            (FileLock::Exclusive, Lock::Exclusive, Lock::None) => {
-                *file_lock = FileLock::Read { count: 0 };
+            (FileLockState::Exclusive, Lock::Exclusive, Lock::None) => {
+                *file_lock = FileLockState::Read { count: 0 };
                 self.conn_lock = to;
                 Ok(true)
             }
@@ -330,27 +494,80 @@ impl FileConnection {
     }
 }
 
-impl FileLock {
+fn transition_wal_index_lock(
+    state: &WalIndexLockState,
+    from: WalIndexLock,
+    to: WalIndexLock,
+) -> Option<WalIndexLockState> {
+    match (state, from, to) {
+        // no change between from and to
+        (_, WalIndexLock::None, WalIndexLock::None)
+        | (_, WalIndexLock::Shared, WalIndexLock::Shared)
+        | (_, WalIndexLock::Exclusive, WalIndexLock::Exclusive) => Some(*state),
+
+        (WalIndexLockState::Shared { count }, WalIndexLock::None, WalIndexLock::Shared) => {
+            Some(WalIndexLockState::Shared { count: count + 1 })
+        }
+
+        (WalIndexLockState::Shared { count }, WalIndexLock::None, WalIndexLock::Exclusive) => {
+            if *count == 0 {
+                Some(WalIndexLockState::Exclusive)
+            } else {
+                None
+            }
+        }
+
+        (WalIndexLockState::Shared { count }, WalIndexLock::Shared, WalIndexLock::None) => {
+            Some(WalIndexLockState::Shared {
+                count: count.saturating_sub(1),
+            })
+        }
+
+        (WalIndexLockState::Shared { count }, WalIndexLock::Shared, WalIndexLock::Exclusive) => {
+            if *count == 1 {
+                Some(WalIndexLockState::Exclusive)
+            } else {
+                None
+            }
+        }
+
+        (WalIndexLockState::Exclusive, WalIndexLock::Exclusive, WalIndexLock::None) => {
+            Some(WalIndexLockState::Shared { count: 0 })
+        }
+        (WalIndexLockState::Exclusive, WalIndexLock::Exclusive, WalIndexLock::Shared) => {
+            Some(WalIndexLockState::Shared { count: 1 })
+        }
+
+        // invalid state transition
+        (WalIndexLockState::Shared { .. }, WalIndexLock::Exclusive, _)
+        | (WalIndexLockState::Exclusive, WalIndexLock::None, WalIndexLock::Shared)
+        | (WalIndexLockState::Exclusive, WalIndexLock::None, WalIndexLock::Exclusive)
+        | (WalIndexLockState::Exclusive, WalIndexLock::Shared, WalIndexLock::None)
+        | (WalIndexLockState::Exclusive, WalIndexLock::Shared, WalIndexLock::Exclusive) => None,
+    }
+}
+
+impl FileLockState {
     fn increment(&mut self) {
         *self = match *self {
-            FileLock::Read { count } => FileLock::Read { count: count + 1 },
-            FileLock::Reserved { count } => FileLock::Reserved { count: count + 1 },
-            FileLock::Pending { count } => FileLock::Pending { count: count + 1 },
-            FileLock::Exclusive => FileLock::Exclusive,
+            FileLockState::Read { count } => FileLockState::Read { count: count + 1 },
+            FileLockState::Reserved { count } => FileLockState::Reserved { count: count + 1 },
+            FileLockState::Pending { count } => FileLockState::Pending { count: count + 1 },
+            FileLockState::Exclusive => FileLockState::Exclusive,
         };
     }
 
     fn decrement(&mut self) {
         *self = match *self {
-            FileLock::Read { count } => FileLock::Read { count: count - 1 },
-            FileLock::Reserved { count } => FileLock::Reserved { count: count - 1 },
-            FileLock::Pending { count } => FileLock::Pending { count: count - 1 },
-            FileLock::Exclusive => FileLock::Exclusive,
+            FileLockState::Read { count } => FileLockState::Read { count: count - 1 },
+            FileLockState::Reserved { count } => FileLockState::Reserved { count: count - 1 },
+            FileLockState::Pending { count } => FileLockState::Pending { count: count - 1 },
+            FileLockState::Exclusive => FileLockState::Exclusive,
         };
     }
 }
 
-impl Default for FileLock {
+impl Default for FileLockState {
     fn default() -> Self {
         Self::Read { count: 0 }
     }
@@ -362,6 +579,32 @@ impl Drop for FileConnection {
             // make sure lock is removed once connection got closed
             self.lock(Lock::None).ok();
         }
+
+        // let has_lock = self
+        //     .wal_index_lock
+        //     .iter()
+        //     .any(|(_, lock)| *lock != WalIndexLock::None);
+        // if has_lock {
+        //     log::error!("{{{}}} UNLOCKING ON DROP", self.id);
+        //     let (start, end) = {
+        //         let wal_index = self.wal_index.lock().unwrap();
+        //         let start = wal_index.locks.keys().min().cloned();
+        //         let end = wal_index.locks.keys().max().cloned();
+        //         (start, end)
+        //     };
+        //     if let Some((start, end)) = start.zip(end) {
+        //         if let Err(err) = self.handle_request(Request::LockWalIndex {
+        //             locks: start..end.saturating_add(1),
+        //             lock: WalIndexLock::None,
+        //         }) {
+        //             log::error!(
+        //                 "{{{}}} failed to unlock wal index on connection close: {}",
+        //                 self.id,
+        //                 err
+        //             );
+        //         }
+        //     }
+        // }
     }
 }
 
@@ -391,4 +634,10 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     ret
+}
+
+impl Default for WalIndexLockState {
+    fn default() -> Self {
+        WalIndexLockState::Shared { count: 0 }
+    }
 }
