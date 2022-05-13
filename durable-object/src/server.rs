@@ -161,8 +161,8 @@ impl Server {
                         conn.send(Response::Open)?;
                         f
                     }
-                    Err(err) => {
-                        log::error!("open error: {}", err);
+                    Err(_err) => {
+                        // log::error!("open error: {}", err);
                         conn.send(Response::Denied)?;
                         return Ok(());
                     }
