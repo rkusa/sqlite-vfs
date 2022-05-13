@@ -298,6 +298,7 @@ struct FileExt<V, F> {
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
     wal_index: HashMap<u32, Pin<Box<[u8; 32768]>>>,
     wal_index_locks: HashMap<u8, WalIndexLock>,
+    has_exclusive_lock: bool,
     id: usize,
 }
 
@@ -399,6 +400,7 @@ mod vfs {
             last_error: Arc::clone(&state.last_error),
             wal_index: Default::default(),
             wal_index_locks: Default::default(),
+            has_exclusive_lock: false,
             id: state.next_id,
         });
         state.next_id = state.next_id.overflowing_add(1).0;
@@ -803,7 +805,36 @@ mod io {
         };
         match state.file.lock(lock) {
             Ok(true) => {
+                state.has_exclusive_lock = lock == Lock::Exclusive;
                 log::trace!("[{}] lock={:?} ({})", state.id, lock, state.db_name);
+
+                // If just acquired a exclusive database lock while not having any exclusive lock
+                // on the wal index, make sure the wal index is up to date.
+                if state.has_exclusive_lock {
+                    let has_exclusive_wal_index = state
+                        .wal_index_locks
+                        .iter()
+                        .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+
+                    if !has_exclusive_wal_index {
+                        log::trace!(
+                            "[{}] acquired exclusive db lock, pulling wal index changes",
+                            state.id,
+                        );
+                        for (region, data) in &mut state.wal_index {
+                            if let Err(err) =
+                                F::WalIndex::pull(&mut state.file, *region as u32, data)
+                            {
+                                log::error!(
+                                    "[{}] pulling wal index changes failed: {}",
+                                    state.id,
+                                    err
+                                )
+                            }
+                        }
+                    }
+                }
+
                 ffi::SQLITE_OK
             }
             Ok(false) => {
@@ -836,6 +867,7 @@ mod io {
         };
         match state.file.unlock(lock) {
             Ok(true) => {
+                state.has_exclusive_lock = lock == Lock::Exclusive;
                 log::trace!("[{}] unlock={:?} ({})", state.id, lock, state.db_name);
                 ffi::SQLITE_OK
             }
@@ -1241,6 +1273,20 @@ mod io {
             Err(_) => return,
         };
         log::trace!("[{}] shm_barrier ({})", state.id, state.db_name);
+
+        if state.has_exclusive_lock {
+            log::trace!(
+                "[{}] has exclusive db lock, pushing wal index changes",
+                state.id,
+            );
+            for (region, data) in &mut state.wal_index {
+                if let Err(err) = F::WalIndex::push(&mut state.file, *region as u32, data) {
+                    log::error!("[{}] pushing wal index changes failed: {}", state.id, err)
+                }
+            }
+
+            return;
+        }
 
         let has_exclusive = state
             .wal_index_locks
