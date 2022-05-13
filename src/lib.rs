@@ -1203,18 +1203,6 @@ mod io {
                 }
             }
         } else {
-            // // determine whether the connection has an exclusive lock before this action
-            // let has_exclusive_before = state
-            //     .wal_index_locks
-            //     .iter()
-            //     .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
-
-            // // determine whether the connection still has an exclusive lock after this action
-            // let has_exclusive_after = state
-            //     .wal_index_locks
-            //     .iter()
-            //     .any(|(region, lock)| *lock == WalIndexLock::Exclusive && !range.contains(region));
-
             let releases_any_exclusive = state
                 .wal_index_locks
                 .iter()

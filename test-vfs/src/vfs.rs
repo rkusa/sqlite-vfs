@@ -162,8 +162,9 @@ impl sqlite_vfs::DatabaseHandle for Connection {
 }
 
 impl WalIndex<Connection> for WalConnection {
-    fn map(_handle: &mut Connection, _region: u32) -> Result<[u8; 32768], std::io::Error> {
-        Ok([0; 32768])
+    fn map(handle: &mut Connection, region: u32) -> Result<[u8; 32768], std::io::Error> {
+        let mut client = handle.client.lock().unwrap();
+        client.get_wal_index(region)
     }
 
     fn lock(
