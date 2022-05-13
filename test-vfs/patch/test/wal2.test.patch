@@ -1,0 +1,155 @@
+diff --git a/test-vfs/wal2.test b/test-vfs/wal2.test
+index ae6134d..955587f 100644
+--- a/test-vfs/wal2.test
++++ b/test-vfs/wal2.test
+@@ -1070,150 +1070,6 @@ db close
+ db2 close
+ tvfs delete
+ 
+-#-------------------------------------------------------------------------
+-# If a connection is required to create a WAL or SHM file, it creates 
+-# the new files with the same file-system permissions as the database 
+-# file itself. Test this.
+-#
+-if {$::tcl_platform(platform) == "unix"} {
+-  faultsim_delete_and_reopen
+-  # Changed on 2012-02-13: umask is deliberately ignored for -wal files.
+-  #set umask [exec /bin/sh -c umask]
+-  set umask 0
+-  
+-
+-  do_test wal2-12.1 {
+-    sqlite3 db test.db
+-    execsql { 
+-      CREATE TABLE tx(y, z);
+-      PRAGMA journal_mode = WAL;
+-    }
+-    db close
+-    list [file exists test.db-wal] [file exists test.db-shm]
+-  } {0 0}
+-  
+-  foreach {tn permissions} {
+-   1 00644
+-   2 00666
+-   3 00600
+-   4 00755
+-  } {
+-    set effective [format %.5o [expr $permissions & ~$umask]]
+-    do_test wal2-12.2.$tn.1 {
+-      file attributes test.db -permissions $permissions
+-      string map {o 0} [file attributes test.db -permissions]
+-    } $permissions
+-    do_test wal2-12.2.$tn.2 {
+-      list [file exists test.db-wal] [file exists test.db-shm]
+-    } {0 0}
+-    do_test wal2-12.2.$tn.3 {
+-      sqlite3 db test.db
+-      execsql { INSERT INTO tx DEFAULT VALUES }
+-      list [file exists test.db-wal] [file exists test.db-shm]
+-    } {1 1}
+-    do_test wal2-12.2.$tn.4 {
+-      set x [list [file attr test.db-wal -perm] [file attr test.db-shm -perm]]
+-      string map {o 0} $x
+-    } [list $effective $effective]
+-    do_test wal2-12.2.$tn.5 {
+-      db close
+-      list [file exists test.db-wal] [file exists test.db-shm]
+-    } {0 0}
+-  }
+-}
+-
+-#-------------------------------------------------------------------------
+-# Test the libraries response to discovering that one or more of the
+-# database, wal or shm files cannot be opened, or can only be opened
+-# read-only.
+-#
+-if {$::tcl_platform(platform) == "unix"} {
+-  proc perm {} {
+-    set L [list]
+-    foreach f {test.db test.db-wal test.db-shm} {
+-      if {[file exists $f]} {
+-        lappend L [file attr $f -perm]
+-      } else {
+-        lappend L {}
+-      }
+-    }
+-    set L
+-  }
+-
+-  faultsim_delete_and_reopen
+-  execsql {
+-    PRAGMA journal_mode = WAL;
+-    CREATE TABLE t1(a, b);
+-    PRAGMA wal_checkpoint;
+-    INSERT INTO t1 VALUES('3.14', '2.72');
+-  }
+-  do_test wal2-13.1.1 {
+-    list [file exists test.db-shm] [file exists test.db-wal]
+-  } {1 1}
+-  faultsim_save_and_close
+-
+-  foreach {tn db_perm wal_perm shm_perm can_open can_read can_write} {
+-    2   00644   00644   00644   1   1   1
+-    3   00644   00400   00644   1   1   0
+-    4   00644   00644   00400   1   1   0
+-    5   00400   00644   00644   1   1   0
+-
+-    7   00644   00000   00644   1   0   0
+-    8   00644   00644   00000   1   0   0
+-    9   00000   00644   00644   0   0   0
+-  } {
+-    faultsim_restore
+-    do_test wal2-13.$tn.1 {
+-      file attr test.db     -perm $db_perm
+-      file attr test.db-wal -perm $wal_perm
+-      file attr test.db-shm -perm $shm_perm
+-
+-      set     L [file attr test.db -perm]
+-      lappend L [file attr test.db-wal -perm]
+-      lappend L [file attr test.db-shm -perm]
+-      string map {o 0} $L
+-    } [list $db_perm $wal_perm $shm_perm]
+-
+-    # If $can_open is true, then it should be possible to open a database
+-    # handle. Otherwise, if $can_open is 0, attempting to open the db
+-    # handle throws an "unable to open database file" exception.
+-    #
+-    set r(1) {0 ok}
+-    set r(0) {1 {unable to open database file}}
+-    do_test wal2-13.$tn.2 {
+-      list [catch {sqlite3 db test.db ; set {} ok} msg] $msg
+-    } $r($can_open)
+-
+-    if {$can_open} {
+-
+-      # If $can_read is true, then the client should be able to read from
+-      # the database file. If $can_read is false, attempting to read should
+-      # throw the "unable to open database file" exception. 
+-      #
+-      set a(0) {1 {unable to open database file}}
+-      set a(1) {0 {3.14 2.72}}
+-      do_test wal2-13.$tn.3 {
+-        catchsql { SELECT * FROM t1 }
+-      } $a($can_read)
+-  
+-      # Now try to write to the db file. If the client can read but not
+-      # write, then it should throw the familiar "unable to open db file"
+-      # exception. If it can read but not write, the exception should
+-      # be "attempt to write a read only database".
+-      #
+-      # If the client can read and write, the operation should succeed.
+-      #
+-      set b(0,0) {1 {unable to open database file}}
+-      set b(1,0) {1 {attempt to write a readonly database}}
+-      set b(1,1) {0 {}}
+-      do_test wal2-13.$tn.4 {
+-        catchsql { INSERT INTO t1 DEFAULT VALUES }
+-      } $b($can_read,$can_write)
+-    }
+-    catch { db close }
+-  }
+-}
+-
+ #-------------------------------------------------------------------------
+ # Test that "PRAGMA checkpoint_fullsync" appears to be working.
+ #

@@ -33,6 +33,12 @@ RUN cd build && make \
 RUN chown -R sqlite:sqlite /home/sqlite/build
 RUN rm -rf /home/sqlite/test-vfs
 
+# Remove unix file system specific tests from wal2 that expect the db-shm to be persisted to disk
+# and also care about file permissions for db-wal and db-shm files. Since the test VFS isn't meant
+# for saving files to disk, those tests are removed.
+COPY patch/test/wal2.test.patch wal2.test.patch
+RUN patch sqlite-src-3370200/test/wal2.test wal2.test.patch && rm wal2.test.patch
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
