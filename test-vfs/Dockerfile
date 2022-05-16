@@ -39,6 +39,9 @@ RUN rm -rf /home/sqlite/test-vfs
 COPY patch/test/wal2.test.patch wal2.test.patch
 RUN patch sqlite-src-3370200/test/wal2.test wal2.test.patch && rm wal2.test.patch
 
+# Remove e_walauto.test as it requires an actually memory mapped wal index
+RUN rm sqlite-src-3370200/test/e_walauto.test
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
