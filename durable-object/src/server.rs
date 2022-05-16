@@ -311,16 +311,12 @@ impl FileConnection {
             }
             Request::GetWalIndex { region } => {
                 let mut wal_index = self.wal_index.lock().unwrap();
-                // let has_exclusive_lock = wal_index
-                //     .locks
-                //     .iter()
-                //     .any(|(_, lock)| *lock == WalIndexLockState::Exclusive);
-                // if has_exclusive_lock {
-                //     log::debug!("{{{}}} awaiting release of exclusive locks", self.id);
-                //     // TODO: use channel for notification instead of sleep/polling
-                //     std::thread::sleep(std::time::Duration::from_millis(10));
-                //     continue;
-                // }
+
+                // Some tests rely on the existance of the `.db-shm` file, thus make sure it exists,
+                // even though it isn't actually used for anything.
+                if wal_index.data.is_empty() {
+                    fs::write(self.path.with_extension("db-shm"), "")?;
+                }
 
                 let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
                 self.buffer.resize(32768, 0);
@@ -374,6 +370,7 @@ impl FileConnection {
                 let mut wal_index = self.wal_index.lock().unwrap();
                 wal_index.data.clear();
                 wal_index.locks.clear();
+                fs::remove_file(self.path.with_extension("db-shm")).ok();
                 Ok(Response::DeleteWalIndex)
             }
         }
@@ -442,7 +439,7 @@ impl FileConnection {
                 | FileLockState::Pending { .. }
                 | FileLockState::Exclusive,
                 Lock::Shared,
-                Lock::Reserved,
+                Lock::Reserved | Lock::Exclusive,
             ) => Ok(false),
 
             // Acquire an exclusive lock.
