@@ -369,20 +369,23 @@ mod vfs {
         };
 
         let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
-        let file = match state.vfs.open(&name, opts.clone()) {
+        let result = state.vfs.open(&name, opts.clone()).or_else(|err| {
+            if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
+                // Try again as readonly
+                opts.access = OpenAccess::Read;
+                state.vfs.open(&name, opts.clone())
+            } else {
+                Err(err)
+            }
+        });
+
+        let file = match result {
             Ok(f) => f,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
+            }
             Err(err) => {
-                if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
-                    // Try again as readonly
-                    opts.access = OpenAccess::Read;
-                    if let Ok(f) = state.vfs.open(&name, opts.clone()) {
-                        f
-                    } else {
-                        return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
-                    }
-                } else {
-                    return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
-                }
+                return state.set_last_error(ffi::SQLITE_IOERR, err);
             }
         };
 

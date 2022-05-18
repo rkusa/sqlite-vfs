@@ -104,6 +104,10 @@ impl Server {
         match conn.receive()? {
             Some(Request::Open { access, db }) => {
                 let path = normalize_path(Path::new(&db));
+                if path.is_dir() {
+                    return Ok(());
+                }
+
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
                     match objects.entry(path.clone()) {
