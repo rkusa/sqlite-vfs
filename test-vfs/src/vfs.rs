@@ -110,9 +110,9 @@ impl sqlite_vfs::DatabaseHandle for Connection {
         Ok(())
     }
 
-    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error> {
+    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
         let mut client = self.client.lock().unwrap();
-        client.truncate(size)
+        client.set_len(size)
     }
 
     fn lock(&mut self, to: sqlite_vfs::Lock) -> Result<bool, std::io::Error> {

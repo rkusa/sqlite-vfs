@@ -300,9 +300,9 @@ impl FileConnection {
                 Ok(Response::Put)
             }
             Request::Size => Ok(Response::Size(self.file.metadata()?.len())),
-            Request::Truncate { len } => {
+            Request::SetLen { len } => {
                 self.file.set_len(len)?;
-                Ok(Response::Truncate)
+                Ok(Response::SetLen)
             }
             Request::Reserved => {
                 let file_lock = self.file_lock.read().unwrap();

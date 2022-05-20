@@ -15,7 +15,7 @@ pub enum Response<'a> {
     Get(&'a [u8]),
     Put,
     Size(u64),
-    Truncate,
+    SetLen,
     Reserved(bool),
     GetWalIndex(&'a [u8; 32768]),
     PutWalIndex,
@@ -67,7 +67,7 @@ impl<'a> Response<'a> {
                 );
                 Ok(Response::Size(len))
             }
-            8 => Ok(Response::Truncate),
+            8 => Ok(Response::SetLen),
             9 => Ok(Response::Reserved(data.get(2) == Some(&1))),
             10 => {
                 let data = data[2..]
@@ -107,7 +107,7 @@ impl<'a> Response<'a> {
                 buffer.extend_from_slice(&7u16.to_be_bytes());
                 buffer.extend_from_slice(&len.to_be_bytes());
             }
-            Response::Truncate => buffer.extend_from_slice(&8u16.to_be_bytes()),
+            Response::SetLen => buffer.extend_from_slice(&8u16.to_be_bytes()),
             Response::Reserved(reserved) => {
                 buffer.extend_from_slice(&9u16.to_be_bytes());
                 buffer.extend_from_slice(&[if *reserved { 1 } else { 0 }]);
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_response_truncate_encode_decode() {
-        let res = Response::Truncate;
+        let res = Response::SetLen;
         let mut encoded = Vec::new();
         res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);

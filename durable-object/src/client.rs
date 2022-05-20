@@ -108,9 +108,9 @@ impl Client {
         }
     }
 
-    pub fn truncate(&mut self, len: u64) -> io::Result<()> {
-        let res = self.send(Request::Truncate { len })?;
-        if res != Response::Truncate {
+    pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+        let res = self.send(Request::SetLen { len })?;
+        if res != Response::SetLen {
             return Err(io::Error::new(
                 ErrorKind::Other,
                 "received unexpected response",

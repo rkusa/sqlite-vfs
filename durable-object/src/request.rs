@@ -24,7 +24,7 @@ pub enum Request<'a> {
         data: &'a [u8],
     },
     Size,
-    Truncate {
+    SetLen {
         len: u64,
     },
     Reserved,
@@ -160,7 +160,7 @@ impl<'a> Request<'a> {
                         .try_into()
                         .map_err(|err| std::io::Error::new(ErrorKind::UnexpectedEof, err))?,
                 );
-                Ok(Request::Truncate { len })
+                Ok(Request::SetLen { len })
             }
             9 => Ok(Request::Reserved),
             10 => {
@@ -246,7 +246,7 @@ impl<'a> Request<'a> {
             Request::Size => {
                 buffer.extend_from_slice(&7u16.to_be_bytes()); // type
             }
-            Request::Truncate { len } => {
+            Request::SetLen { len } => {
                 buffer.extend_from_slice(&8u16.to_be_bytes()); // type
                 buffer.extend_from_slice(&len.to_be_bytes()); // len
             }
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_request_truncate_encode_decode() {
-        let req = Request::Truncate { len: 42 };
+        let req = Request::SetLen { len: 42 };
         let mut encoded = Vec::new();
         req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);

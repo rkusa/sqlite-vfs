@@ -40,8 +40,8 @@ where
     /// `true`, only the data and not the metadata (like size, access time, etc) should be synced.
     fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error>;
 
-    /// Truncat the database file to the specified `size`.
-    fn truncate(&mut self, size: u64) -> Result<(), std::io::Error>;
+    /// Set the database file to the specified `size`. Truncates or extends the underlying stroage.
+    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error>;
 
     /// Lock the database. Returns whether the requested lock could be aquired.
     /// Locking sequence:
@@ -300,6 +300,7 @@ struct FileExt<V, F> {
     wal_index_locks: HashMap<u8, WalIndexLock>,
     has_exclusive_lock: bool,
     id: usize,
+    chunk_size: Option<usize>,
 }
 
 // Example mem-fs implementation:
@@ -405,6 +406,7 @@ mod vfs {
             wal_index_locks: Default::default(),
             has_exclusive_lock: false,
             id: state.next_id,
+            chunk_size: None,
         });
         state.next_id = state.next_id.overflowing_add(1).0;
 
@@ -740,9 +742,16 @@ mod io {
             Ok(f) => f,
             Err(_) => return ffi::SQLITE_IOERR_FSYNC,
         };
-        log::trace!("[{}] truncate ({})", state.id, state.db_name);
 
-        if let Err(err) = state.file.truncate(size as u64) {
+        let size: u64 = if let Some(chunk_size) = state.chunk_size {
+            (((size as usize + chunk_size - 1) / chunk_size) * chunk_size) as u64
+        } else {
+            size as u64
+        };
+
+        log::trace!("[{}] truncate size={} ({})", state.id, size, state.db_name);
+
+        if let Err(err) = state.file.set_len(size) {
             return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
         }
 
@@ -962,11 +971,37 @@ mod io {
             }
 
             // Give the VFS layer a hint of how large the database file will grow to be during the
-            // current transaction. Not implemented
-            ffi::SQLITE_FCNTL_SIZE_HINT => ffi::SQLITE_OK,
+            // current transaction.
+            ffi::SQLITE_FCNTL_SIZE_HINT => {
+                let size_hint = match (p_arg as *mut i64)
+                    .as_ref()
+                    .cloned()
+                    .and_then(|s| u64::try_from(s).ok())
+                {
+                    Some(chunk_size) => chunk_size,
+                    None => {
+                        return state.set_last_error(
+                            ffi::SQLITE_NOTFOUND,
+                            std::io::Error::new(ErrorKind::Other, "expect size hint arg"),
+                        );
+                    }
+                };
+
+                if let Some(chunk_size) = state.chunk_size {
+                    let chunk_size = chunk_size as u64;
+                    let size = ((size_hint + chunk_size - 1) / chunk_size) * chunk_size;
+                    if let Err(err) = state.file.set_len(size) {
+                        return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
+                    }
+                } else if let Err(err) = state.file.set_len(size_hint) {
+                    return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
+                }
+
+                ffi::SQLITE_OK
+            }
 
             // Request that the VFS extends and truncates the database file in chunks of a size
-            // specified by the user. Return an error as this is not forwarded to the [Vfs]  trait
+            // specified by the user. Return an error as this is not forwarded to the [Vfs] trait
             // right now.
             ffi::SQLITE_FCNTL_CHUNK_SIZE => {
                 let chunk_size = match (p_arg as *mut i32)
@@ -986,6 +1021,8 @@ mod io {
                 if let Err(err) = state.file.set_chunk_size(chunk_size) {
                     return state.set_last_error(ffi::SQLITE_ERROR, err);
                 }
+
+                state.chunk_size = Some(chunk_size);
 
                 ffi::SQLITE_OK
             }
