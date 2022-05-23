@@ -568,10 +568,13 @@ mod vfs {
     ) -> c_int {
         log::trace!("randomness");
 
-        use rand::Rng;
-
         let bytes = slice::from_raw_parts_mut(z_buf_out, n_byte as usize);
-        rand::thread_rng().fill(bytes);
+        if cfg!(feature = "sqlite_test") {
+            // During testing, the buffer is simply initialized to all zeroes for repeatability
+            bytes.fill(0);
+        } else {
+            rand::Rng::fill(&mut rand::thread_rng(), bytes)
+        }
         bytes.len() as c_int
     }
 
