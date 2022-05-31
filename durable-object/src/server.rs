@@ -319,7 +319,16 @@ impl FileConnection {
                 // Some tests rely on the existance of the `.db-shm` file, thus make sure it exists,
                 // even though it isn't actually used for anything.
                 if wal_index.data.is_empty() {
-                    fs::write(self.path.with_extension("db-shm"), "")?;
+                    fs::write(
+                        self.path.with_extension(format!(
+                            "{}-shm",
+                            self.path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("db")
+                        )),
+                        "",
+                    )?;
                 }
 
                 let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
