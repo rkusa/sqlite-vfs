@@ -657,10 +657,6 @@ mod io {
     use std::collections::hash_map::Entry;
     use std::mem;
 
-    use crate::ffi::{
-        sqlite3_dec_diskfull_pending, sqlite3_get_diskfull_pending, sqlite3_set_diskfull,
-    };
-
     use super::*;
 
     /// Close a file.
@@ -736,12 +732,12 @@ mod io {
         let result = state.file.write_all_at(data, i_ofst as u64);
 
         #[cfg(feature = "sqlite_test")]
-        let result = if sqlite3_get_diskfull_pending() > 0 {
-            if sqlite3_get_diskfull_pending() == 1 {
-                sqlite3_set_diskfull();
+        let result = if ffi::sqlite3_get_diskfull_pending() > 0 {
+            if ffi::sqlite3_get_diskfull_pending() == 1 {
+                ffi::sqlite3_set_diskfull();
                 Err(ErrorKind::WriteZero.into())
             } else {
-                sqlite3_dec_diskfull_pending();
+                ffi::sqlite3_dec_diskfull_pending();
                 result
             }
         } else {
