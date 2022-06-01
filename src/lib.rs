@@ -657,6 +657,10 @@ mod io {
     use std::collections::hash_map::Entry;
     use std::mem;
 
+    use crate::ffi::{
+        sqlite3_dec_diskfull_pending, sqlite3_get_diskfull_pending, sqlite3_set_diskfull,
+    };
+
     use super::*;
 
     /// Close a file.
@@ -729,8 +733,27 @@ mod io {
         );
 
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
-        if let Err(err) = state.file.write_all_at(data, i_ofst as u64) {
-            return state.set_last_error(ffi::SQLITE_IOERR_WRITE, err);
+        let result = state.file.write_all_at(data, i_ofst as u64);
+
+        #[cfg(feature = "sqlite_test")]
+        let result = if sqlite3_get_diskfull_pending() > 0 {
+            if sqlite3_get_diskfull_pending() == 1 {
+                sqlite3_set_diskfull();
+                Err(ErrorKind::WriteZero.into())
+            } else {
+                sqlite3_dec_diskfull_pending();
+                result
+            }
+        } else {
+            result
+        };
+
+        match result {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::WriteZero => {
+                return state.set_last_error(ffi::SQLITE_FULL, err)
+            }
+            Err(err) => return state.set_last_error(ffi::SQLITE_IOERR_WRITE, err),
         }
 
         ffi::SQLITE_OK

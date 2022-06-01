@@ -316,7 +316,7 @@ impl FileConnection {
             Request::GetWalIndex { region } => {
                 let mut wal_index = self.wal_index.lock().unwrap();
 
-                // Some tests rely on the existance of the `.db-shm` file, thus make sure it exists,
+                // Some tests rely on the existence of the `.db-shm` file, thus make sure it exists,
                 // even though it isn't actually used for anything.
                 if wal_index.data.is_empty() {
                     fs::write(
