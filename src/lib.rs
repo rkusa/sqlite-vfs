@@ -410,6 +410,9 @@ mod vfs {
         });
         state.next_id = state.next_id.overflowing_add(1).0;
 
+        #[cfg(feature = "sqlite_test")]
+        ffi::sqlite3_inc_open_file_count();
+
         ffi::SQLITE_OK
     }
 
@@ -673,6 +676,9 @@ mod io {
             let ext = ext.assume_init(); // extract the value to drop it
             log::trace!("[{}] close ({})", ext.id, ext.db_name);
         }
+
+        #[cfg(feature = "sqlite_test")]
+        ffi::sqlite3_dec_open_file_count();
 
         ffi::SQLITE_OK
     }

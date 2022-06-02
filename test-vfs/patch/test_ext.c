@@ -36,3 +36,12 @@ void sqlite3_set_diskfull() {
   sqlite3_diskfull = 1;
 }
 
+extern int sqlite3_open_file_count;
+
+void sqlite3_inc_open_file_count() {
+  sqlite3_open_file_count++;
+}
+
+void sqlite3_dec_open_file_count() {
+  sqlite3_open_file_count--;
+}

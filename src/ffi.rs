@@ -9,6 +9,8 @@ extern "C" {
     pub fn sqlite3_dec_diskfull_pending();
     pub fn sqlite3_get_diskfull_pending() -> i32;
     pub fn sqlite3_set_diskfull();
+    pub fn sqlite3_inc_open_file_count();
+    pub fn sqlite3_dec_open_file_count();
 }
 
 // Excerpt of
