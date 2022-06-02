@@ -42,6 +42,9 @@ RUN patch sqlite-src-3370200/test/wal2.test wal2.test.patch && rm wal2.test.patc
 # Remove e_walauto.test as it requires an actually memory mapped wal index
 RUN rm sqlite-src-3370200/test/e_walauto.test
 
+# Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
+RUN rm sqlite-src-3370200/test/external_reader.test
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 

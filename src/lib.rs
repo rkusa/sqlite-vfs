@@ -1170,9 +1170,15 @@ mod io {
             // from the wal file to the database file. Silently ignored.
             ffi::SQLITE_FCNTL_CKPT_START => ffi::SQLITE_OK,
 
+            // Detect whether or not there is a database client in another process with a wal-mode
+            // transaction open on the database or not. Not implemented because it is a
+            // unix-specific feature.
+            ffi::SQLITE_FCNTL_EXTERNAL_READER => ffi::SQLITE_NOTFOUND,
+
+            // Unknown use-case. Ignored.
+            ffi::SQLITE_FCNTL_CKSM_FILE => ffi::SQLITE_NOTFOUND,
+
             _ => ffi::SQLITE_NOTFOUND,
-            // The following op codes are mentioned in the docs but are not defined in ffi::*:
-            // SQLITE_FCNTL_EXTERNAL_READER, SQLITE_FCNTL_CKSM_FILE
         }
     }
 
