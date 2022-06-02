@@ -26,7 +26,7 @@ RUN patch -u sqlite-src-3370200/Makefile.in Makefile.in.patch
 RUN mkdir build && cd build && ../sqlite-src-3370200/configure
 COPY patch/test_ext.c sqlite-src-3370200/src/test_ext.c
 RUN cd build && make \
-    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs" \
+    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs -DSQLITE_MAX_MMAP_SIZE=0" \
     LIBS="-L/home/sqlite/test-vfs/target/debug/ -ltest_vfs" \
     USE_AMALGAMATION=0 \
     testfixture
