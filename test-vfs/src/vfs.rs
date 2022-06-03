@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use durable_object::client::Client;
@@ -10,7 +11,9 @@ use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs, WalIndex, WalIndexLock};
 /// any use-cases except running SQLite unit tests, as the locking is only managed in process
 /// memory.
 #[derive(Default)]
-pub struct TestVfs;
+pub struct TestVfs {
+    temp_counter: AtomicUsize,
+}
 
 pub struct Connection {
     client: Mutex<Client>,
@@ -48,8 +51,14 @@ impl Vfs for TestVfs {
     }
 
     fn temporary_name(&self) -> String {
-        // That is not unique, but basically matches what sqlite expects for test runs
-        "/etilqs_/".to_string()
+        std::env::temp_dir()
+            .join(format!(
+                "etilqs_{:x}_{:x}.db",
+                std::process::id(),
+                self.temp_counter.fetch_add(1, Ordering::AcqRel),
+            ))
+            .to_string_lossy()
+            .to_string()
     }
 
     fn full_pathname<'a>(&self, db: &'a str) -> Result<Cow<'a, str>, std::io::Error> {
@@ -65,7 +74,7 @@ impl Vfs for TestVfs {
             .ok_or_else(|| {
                 std::io::Error::new(
                     ErrorKind::Other,
-                    "cannot convert canoicalized path to string",
+                    "cannot convert canonicalized path to string",
                 )
             })?
             .to_string()
