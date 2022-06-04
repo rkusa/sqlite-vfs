@@ -25,8 +25,12 @@ COPY patch/Makefile.in.patch Makefile.in.patch
 RUN patch -u sqlite-src-3370200/Makefile.in Makefile.in.patch
 RUN mkdir build && cd build && ../sqlite-src-3370200/configure
 COPY patch/test_ext.c sqlite-src-3370200/src/test_ext.c
+# -DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs: custom init method that initializes the custom
+#  test vfs
+# -DSQLITE_MAX_MMAP_SIZE=0: disable memory mapping as it is not supported for the custom vfs
+# -DSQLITE_DISABLE_DIRSYNC: disable to skip some tests that are not relevant for a custom vfs
 RUN cd build && make \
-    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs -DSQLITE_MAX_MMAP_SIZE=0" \
+    OPTS="-DSQLITE_EXTRA_INIT=sqlite3_register_test_vfs -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DISABLE_DIRSYNC" \
     LIBS="-L/home/sqlite/test-vfs/target/debug/ -ltest_vfs" \
     USE_AMALGAMATION=0 \
     testfixture
