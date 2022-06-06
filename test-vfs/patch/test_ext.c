@@ -45,3 +45,45 @@ void sqlite3_inc_open_file_count() {
 void sqlite3_dec_open_file_count() {
   sqlite3_open_file_count--;
 }
+
+extern int sqlite3_io_error_pending;
+
+int sqlite3_dec_io_error_pending() {
+  return sqlite3_io_error_pending--;
+}
+
+// extern int sqlite3_io_error_persist;
+
+// int sqlite3_get_io_error_persist() {
+//   return sqlite3_io_error_persist;
+// }
+
+extern int sqlite3_io_error_hit;
+
+// int sqlite3_get_io_error_hit() {
+//   return sqlite3_io_error_persist;
+// }
+
+void sqlite3_inc_io_error_hit() {
+  sqlite3_io_error_hit++;
+}
+
+// void sqlite3_set_io_error_hit(int hit) {
+//   sqlite3_io_error_hit = hit;
+// }
+
+// extern int sqlite3_io_error_benign;
+
+// int sqlite3_get_io_error_benign() {
+//   return sqlite3_io_error_benign;
+// }
+
+// void sqlite3_set_io_error_benign(int benign) {
+//   sqlite3_io_error_benign = benign;
+// }
+
+// extern int sqlite3_io_error_hardhit;
+
+// int sqlite3_inc_io_error_hardhit() {
+//   sqlite3_io_error_hardhit++;
+// }

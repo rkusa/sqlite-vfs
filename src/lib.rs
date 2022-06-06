@@ -427,6 +427,11 @@ mod vfs {
         let path = path.to_string_lossy().to_string();
         log::trace!("delete name={:?}", path);
 
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_ERROR;
+        // }
+
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_DELETE,
@@ -458,6 +463,11 @@ mod vfs {
             CStr::from_ptr(z_path).to_str().ok()
         };
         log::trace!("access z_name={:?} flags={}", name, flags);
+
+        #[cfg(feature = "sqlite_test")]
+        if simulate_io_error() {
+            return ffi::SQLITE_IOERR_ACCESS;
+        }
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
@@ -497,6 +507,11 @@ mod vfs {
     ) -> c_int {
         let name = CStr::from_ptr(z_path).to_string_lossy();
         log::trace!("full_pathname name={}", name);
+
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_ERROR;
+        // }
 
         let state = match vfs_state::<V>(p_vfs) {
             Ok(state) => state,
@@ -737,15 +752,16 @@ mod io {
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
         let result = state.file.write_all_at(data, i_ofst as u64);
 
+        // #[cfg(feature = "sqlite_test")]
+        // let result = if simulate_io_error() {
+        //     Err(ErrorKind::Other.into())
+        // } else {
+        //     result
+        // };
+
         #[cfg(feature = "sqlite_test")]
-        let result = if ffi::sqlite3_get_diskfull_pending() > 0 {
-            if ffi::sqlite3_get_diskfull_pending() == 1 {
-                ffi::sqlite3_set_diskfull();
-                Err(ErrorKind::WriteZero.into())
-            } else {
-                ffi::sqlite3_dec_diskfull_pending();
-                result
-            }
+        let result = if simulate_diskfull_error() {
+            Err(ErrorKind::WriteZero.into())
         } else {
             result
         };
@@ -779,6 +795,11 @@ mod io {
 
         log::trace!("[{}] truncate size={} ({})", state.id, size, state.db_name);
 
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_IOERR_TRUNCATE;
+        // }
+
         if let Err(err) = state.file.set_len(size) {
             return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
         }
@@ -810,6 +831,11 @@ mod io {
             return state.set_last_error(ffi::SQLITE_IOERR_FSYNC, err);
         }
 
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_ERROR;
+        // }
+
         ffi::SQLITE_OK
     }
 
@@ -831,6 +857,11 @@ mod io {
         }) {
             return state.set_last_error(ffi::SQLITE_IOERR_FSTAT, err);
         }
+
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_ERROR;
+        // }
 
         ffi::SQLITE_OK
     }
@@ -933,6 +964,11 @@ mod io {
             Err(_) => return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK,
         };
         log::trace!("[{}] check_reserved_lock ({})", state.id, state.db_name);
+
+        // #[cfg(feature = "sqlite_test")]
+        // if simulate_io_error() {
+        //     return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK;
+        // }
 
         if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
@@ -1085,7 +1121,7 @@ mod io {
 
             // May be invoked by SQLite on the database file handle shortly after it is opened in
             // order to provide a custom VFS with access to the connection's busy-handler callback.
-            // Not implemetned.
+            // Not implemented.
             ffi::SQLITE_FCNTL_BUSYHANDLER => ffi::SQLITE_NOTFOUND,
 
             // Generate a temporary filename. Not implemented.
@@ -1125,7 +1161,7 @@ mod io {
             // database is unlocked. Silently ignored.
             ffi::SQLITE_FCNTL_COMMIT_PHASETWO => ffi::SQLITE_OK,
 
-            // Used for debugging. Sswap the file handle with the one pointed to by the pArg
+            // Used for debugging. Swap the file handle with the one pointed to by the pArg
             // argument. This capability is used during testing and only needs to be supported when
             // SQLITE_TEST is defined. Not implemented.
             ffi::SQLITE_FCNTL_WIN32_SET_HANDLE => ffi::SQLITE_NOTFOUND,
@@ -1158,7 +1194,7 @@ mod io {
             // obtain a file lock using the xLock or xShmLock methods of the VFS. Not implemented.
             ffi::SQLITE_FCNTL_LOCK_TIMEOUT => ffi::SQLITE_NOTFOUND,
 
-            // Used by in-mremory VFS.
+            // Used by in-memory VFS.
             ffi::SQLITE_FCNTL_SIZE_LIMIT => ffi::SQLITE_NOTFOUND,
 
             // Invoked from within a checkpoint in wal mode after the client has finished copying
@@ -1321,7 +1357,7 @@ mod io {
                 .iter()
                 .any(|(region, lock)| *lock == WalIndexLock::Exclusive && range.contains(region));
 
-            // push index changes when moving from any exclusive lock to no exlusive locks
+            // push index changes when moving from any exclusive lock to no exclusive locks
             if releases_any_exclusive {
                 log::trace!(
                     "[{}] releasing an exclusive lock, pushing wal index changes",
@@ -1457,6 +1493,48 @@ mod io {
 
         ffi::SQLITE_OK
     }
+}
+
+// #[cfg(feature = "sqlite_test")]
+// #[inline]
+// unsafe fn simulate_io_error_benign(enabled: bool) {
+//     if enabled {
+//         ffi::sqlite3_set_io_error_benign(1);
+//     } else {
+//         ffi::sqlite3_set_io_error_benign(0)
+//     }
+// }
+
+#[cfg(feature = "sqlite_test")]
+#[inline]
+unsafe fn simulate_io_error() -> bool {
+    // When re-enabling the following, re-check that `ioerr2.test` is still green:
+    // (ffi::sqlite3_get_io_error_persist() != 0 && ffi::sqlite3_get_io_error_hit() != 0) ||
+    if ffi::sqlite3_dec_io_error_pending() == 1 {
+        ffi::sqlite3_inc_io_error_hit();
+        // if ffi::sqlite3_get_io_error_benign() == 0 {
+        //     ffi::sqlite3_inc_io_error_hardhit();
+        // }
+
+        return true;
+    }
+
+    false
+}
+
+#[cfg(feature = "sqlite_test")]
+#[inline]
+unsafe fn simulate_diskfull_error() -> bool {
+    if ffi::sqlite3_get_diskfull_pending() != 0 {
+        if ffi::sqlite3_get_diskfull_pending() == 1 {
+            ffi::sqlite3_set_diskfull();
+            return true;
+        } else {
+            ffi::sqlite3_dec_diskfull_pending();
+        }
+    }
+
+    false
 }
 
 impl<V> State<V> {
