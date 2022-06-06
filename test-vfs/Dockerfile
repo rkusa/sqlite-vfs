@@ -38,10 +38,11 @@ RUN chown -R sqlite:sqlite /home/sqlite/build
 RUN rm -rf /home/sqlite/test-vfs
 
 # Remove unix file system specific tests from wal2 that expect the db-shm to be persisted to disk
-# and also care about file permissions for db-wal and db-shm files. Since the test VFS isn't meant
-# for saving files to disk, those tests are removed.
+# and also care about file permissions for db-wal, db-shm and journal files. Since the test VFS
+# isn't meant for saving files to disk, those tests are removed.
 COPY patch/test/wal2.test.patch wal2.test.patch
 RUN patch sqlite-src-3370200/test/wal2.test wal2.test.patch && rm wal2.test.patch
+RUN rm sqlite-src-3370200/test/journal3.test
 
 # Remove e_walauto.test as it requires an actually memory mapped wal index
 RUN rm sqlite-src-3370200/test/e_walauto.test
