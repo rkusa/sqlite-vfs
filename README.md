@@ -14,3 +14,8 @@ This library is still in _prototype_ state and not ready to be used (except for 
 - ❌ It is not passing the SQLite's TCL test harness yet (WIP: [#1](https://github.com/rkusa/sqlite-vfs/pull/1)).
 - ⚠️ It uses `unsafe` Rust, which hasn't been peer-reviewed yet.
 - ⚠️ It is not used in any production-capacity yet.
+
+## Limitations
+
+- Memory mapping not supported (`xFetch`/`xUnfetch`)
+- Loading extensions not supported (`xDl*`)

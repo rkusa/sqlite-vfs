@@ -50,6 +50,10 @@ RUN rm sqlite-src-3370200/test/e_walauto.test
 # Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
 RUN rm sqlite-src-3370200/test/external_reader.test
 
+# Loading extensions is not supported
+RUN rm sqlite-src-3370200/test/loadext.test
+RUN rm sqlite-src-3370200/test/loadext2.test
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
