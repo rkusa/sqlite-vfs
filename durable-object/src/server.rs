@@ -179,7 +179,10 @@ impl Server {
                 let path = normalize_path(Path::new(&db));
                 let mut file_locks = self.file_locks.write().unwrap();
                 file_locks.remove(&path);
-                fs::remove_file(path)?;
+                match fs::remove_file(path) {
+                    Err(err) if err.kind() != ErrorKind::NotFound => return Err(err),
+                    _ => {}
+                }
                 conn.send(Response::Delete)?;
                 Ok(())
             }
