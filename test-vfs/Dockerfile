@@ -46,6 +46,8 @@ RUN rm sqlite-src-3370200/test/journal3.test
 
 # Remove e_walauto.test as it requires an actually memory mapped wal index
 RUN rm sqlite-src-3370200/test/e_walauto.test
+RUN rm sqlite-src-3370200/test/mmap2.test
+RUN rm sqlite-src-3370200/test/mmapwarm.test
 
 # Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
 RUN rm sqlite-src-3370200/test/external_reader.test

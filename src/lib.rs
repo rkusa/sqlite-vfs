@@ -245,7 +245,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         next_id: 0,
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
-        iVersion: 3,
+        iVersion: 2,
         szOsFile: size_of::<FileState<V, F>>() as i32,
         mxPathname: MAX_PATH_LENGTH as i32, // max path length supported by VFS
         pNext: null_mut(),
