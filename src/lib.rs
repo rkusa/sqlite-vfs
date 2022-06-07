@@ -1051,6 +1051,9 @@ mod io {
                     }
                 };
 
+                // #[cfg(feature = "sqlite_test")]
+                // let _benign = simulate_io_error_benign();
+
                 if let Some(chunk_size) = state.chunk_size {
                     let chunk_size = chunk_size as u64;
                     let size = ((size_hint + chunk_size - 1) / chunk_size) * chunk_size;
@@ -1060,6 +1063,11 @@ mod io {
                 } else if let Err(err) = state.file.set_len(size_hint) {
                     return state.set_last_error(ffi::SQLITE_IOERR_TRUNCATE, err);
                 }
+
+                // #[cfg(feature = "sqlite_test")]
+                // if simulate_io_error() {
+                //     return ffi::SQLITE_IOERR_TRUNCATE;
+                // }
 
                 ffi::SQLITE_OK
             }
@@ -1496,25 +1504,32 @@ mod io {
 }
 
 // #[cfg(feature = "sqlite_test")]
+// struct Benign;
+
+// #[cfg(feature = "sqlite_test")]
 // #[inline]
-// unsafe fn simulate_io_error_benign(enabled: bool) {
-//     if enabled {
-//         ffi::sqlite3_set_io_error_benign(1);
-//     } else {
-//         ffi::sqlite3_set_io_error_benign(0)
+// unsafe fn simulate_io_error_benign() -> Benign {
+//     ffi::sqlite3_set_io_error_benign(1);
+//     Benign
+// }
+
+// #[cfg(feature = "sqlite_test")]
+// impl Drop for Benign {
+//     fn drop(&mut self) {
+//         unsafe { ffi::sqlite3_set_io_error_benign(0) }
 //     }
 // }
 
 #[cfg(feature = "sqlite_test")]
 #[inline]
 unsafe fn simulate_io_error() -> bool {
-    // When re-enabling the following, re-check that `ioerr2.test` is still green:
-    // (ffi::sqlite3_get_io_error_persist() != 0 && ffi::sqlite3_get_io_error_hit() != 0) ||
-    if ffi::sqlite3_dec_io_error_pending() == 1 {
+    if (ffi::sqlite3_get_io_error_persist() != 0 && ffi::sqlite3_get_io_error_hit() != 0)
+        || ffi::sqlite3_dec_io_error_pending() == 1
+    {
         ffi::sqlite3_inc_io_error_hit();
-        // if ffi::sqlite3_get_io_error_benign() == 0 {
-        //     ffi::sqlite3_inc_io_error_hardhit();
-        // }
+        if ffi::sqlite3_get_io_error_benign() == 0 {
+            ffi::sqlite3_inc_io_error_hardhit();
+        }
 
         return true;
     }
@@ -1527,7 +1542,11 @@ unsafe fn simulate_io_error() -> bool {
 unsafe fn simulate_diskfull_error() -> bool {
     if ffi::sqlite3_get_diskfull_pending() != 0 {
         if ffi::sqlite3_get_diskfull_pending() == 1 {
+            if ffi::sqlite3_get_io_error_benign() == 0 {
+                ffi::sqlite3_inc_io_error_hardhit();
+            }
             ffi::sqlite3_set_diskfull();
+            ffi::sqlite3_set_io_error_hit(1);
             return true;
         } else {
             ffi::sqlite3_dec_diskfull_pending();

@@ -12,13 +12,13 @@ extern "C" {
     pub fn sqlite3_inc_open_file_count();
     pub fn sqlite3_dec_open_file_count();
     pub fn sqlite3_dec_io_error_pending() -> i32;
-    // pub fn sqlite3_get_io_error_persist() -> i32;
-    // pub fn sqlite3_get_io_error_hit() -> i32;
+    pub fn sqlite3_get_io_error_persist() -> i32;
+    pub fn sqlite3_get_io_error_hit() -> i32;
     pub fn sqlite3_inc_io_error_hit();
-    // pub fn sqlite3_set_io_error_hit(hit: i32);
-    // pub fn sqlite3_get_io_error_benign() -> i32;
+    pub fn sqlite3_set_io_error_hit(hit: i32);
+    pub fn sqlite3_get_io_error_benign() -> i32;
     // pub fn sqlite3_set_io_error_benign(benign: i32);
-    // pub fn sqlite3_inc_io_error_hardhit();
+    pub fn sqlite3_inc_io_error_hardhit();
 }
 
 // Excerpt of
