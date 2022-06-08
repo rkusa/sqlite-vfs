@@ -752,12 +752,12 @@ mod io {
         let data = slice::from_raw_parts(z as *mut u8, i_amt as usize);
         let result = state.file.write_all_at(data, i_ofst as u64);
 
-        // #[cfg(feature = "sqlite_test")]
-        // let result = if simulate_io_error() {
-        //     Err(ErrorKind::Other.into())
-        // } else {
-        //     result
-        // };
+        #[cfg(feature = "sqlite_test")]
+        let result = if simulate_io_error() {
+            Err(ErrorKind::Other.into())
+        } else {
+            result
+        };
 
         #[cfg(feature = "sqlite_test")]
         let result = if simulate_diskfull_error() {
@@ -1520,6 +1520,10 @@ mod io {
 //     }
 // }
 
+// Note: When adding additional simulate_io_error() calls, retest:
+// - malloc.test
+// - ioerr2.test
+// - backup_ioerr.test
 #[cfg(feature = "sqlite_test")]
 #[inline]
 unsafe fn simulate_io_error() -> bool {
