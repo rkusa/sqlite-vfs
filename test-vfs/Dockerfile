@@ -52,6 +52,9 @@ RUN rm sqlite-src-3370200/test/mmapwarm.test
 # Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
 RUN rm sqlite-src-3370200/test/external_reader.test
 
+# Remove oserror.test as it tests specifics of the default unix/windows VFS modules.
+RUN rm sqlite-src-3370200/test/oserror.test
+
 # Loading extensions is not supported
 RUN rm sqlite-src-3370200/test/loadext.test
 RUN rm sqlite-src-3370200/test/loadext2.test
