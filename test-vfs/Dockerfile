@@ -59,6 +59,10 @@ RUN rm sqlite-src-3370200/test/oserror.test
 RUN rm sqlite-src-3370200/test/loadext.test
 RUN rm sqlite-src-3370200/test/loadext2.test
 
+# Remove long running tests that while being green, don't contribute tests relevant for a VFS
+# implementation so it is not forth waiting for them.
+RUN rm sqlite-src-3370200/test/backup_ioerr.test
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
