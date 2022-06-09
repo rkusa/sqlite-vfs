@@ -1,11 +1,13 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock, Weak};
+
+use lru::LruCache;
 
 use crate::connection::Connection;
 use crate::request::{OpenAccess, WalIndexLock};
@@ -13,19 +15,23 @@ use crate::request::{OpenAccess, WalIndexLock};
 use super::request::{Lock, Request};
 use super::response::Response;
 
-#[derive(Default)]
 pub struct Server {
     next_id: AtomicUsize,
     #[allow(clippy::type_complexity)]
     file_locks: Arc<RwLock<HashMap<PathBuf, Weak<RwLock<FileLockState>>>>>,
     #[allow(clippy::type_complexity)]
     wal_indices: Arc<RwLock<HashMap<PathBuf, Weak<Mutex<WalIndex>>>>>,
+    // Use LRU cache for files to limit the amount of open files (to not run into the OS limit of
+    // open files).
+    files: Arc<Mutex<LruCache<PathBuf, Arc<File>>>>,
 }
 
 pub struct FileConnection {
     id: usize,
     path: PathBuf,
-    file: File,
+    open_options: OpenOptions,
+    files: Arc<Mutex<LruCache<PathBuf, Arc<File>>>>,
+    file: Weak<File>,
     file_lock: Arc<RwLock<FileLockState>>,
     conn_lock: Lock,
     buffer: Vec<u8>,
@@ -172,7 +178,27 @@ impl Server {
                     }
                 };
 
-                FileConnection::handle(conn, id, path, f, file_lock, wal_index)?;
+                let file = {
+                    let file = Arc::new(f);
+                    let mut files = self.files.lock().unwrap();
+                    files.put(path.clone(), file.clone());
+                    Arc::downgrade(&file)
+                };
+
+                let file_conn = FileConnection {
+                    id,
+                    path,
+                    file,
+                    files: self.files.clone(),
+                    open_options: o,
+                    file_lock,
+                    conn_lock: Lock::None,
+                    buffer: Vec::with_capacity(4096),
+                    wal_index,
+                    wal_index_lock: Default::default(),
+                };
+
+                file_conn.handle(conn)?;
                 Ok(())
             }
             Some(Request::Delete { db }) => {
@@ -221,31 +247,26 @@ impl ServerConnection {
 }
 
 impl FileConnection {
-    fn handle(
-        mut conn: ServerConnection,
-        id: usize,
-        path: PathBuf,
-        file: File,
-        file_lock: Arc<RwLock<FileLockState>>,
-        wal_index: Arc<Mutex<WalIndex>>,
-    ) -> io::Result<()> {
-        let mut file_conn = Self {
-            id,
-            path,
-            file,
-            file_lock,
-            conn_lock: Lock::None,
-            buffer: Vec::with_capacity(4096),
-            wal_index,
-            wal_index_lock: Default::default(),
-        };
-
+    fn handle(mut self, mut conn: ServerConnection) -> io::Result<()> {
         while let Some(req) = conn.receive()? {
-            let res = file_conn.handle_request(req)?;
+            let res = self.handle_request(req)?;
             conn.send(res)?;
         }
 
         Ok(())
+    }
+
+    fn file(&mut self) -> io::Result<File> {
+        if let Some(f) = self.file.upgrade() {
+            return f.try_clone();
+        }
+
+        let file = Arc::new(self.open_options.open(&self.path)?);
+        self.file = Arc::downgrade(&file);
+        let mut files = self.files.lock().unwrap();
+        files.put(self.path.clone(), file.clone());
+
+        file.try_clone()
     }
 
     fn handle_request(&mut self, req: Request) -> io::Result<Response> {
@@ -277,13 +298,14 @@ impl FileConnection {
                 }
             }
             Request::Get { src } => {
-                self.file.seek(SeekFrom::Start(src.start))?;
+                let mut file = self.file()?;
+                file.seek(SeekFrom::Start(src.start))?;
 
                 self.buffer.resize((src.end - src.start) as usize, 0);
                 self.buffer.shrink_to((src.end - src.start) as usize);
                 let mut offset = 0;
                 while offset < self.buffer.len() {
-                    match self.file.read(&mut self.buffer[offset..]) {
+                    match file.read(&mut self.buffer[offset..]) {
                         Ok(0) => break,
                         Ok(n) => {
                             offset += n;
@@ -297,14 +319,19 @@ impl FileConnection {
                 Ok(Response::Get(&self.buffer))
             }
             Request::Put { dst, data } => {
-                self.file.seek(SeekFrom::Start(dst))?;
-                self.file.write_all(data)?;
-                self.file.flush()?;
+                let mut file = self.file()?;
+                file.seek(SeekFrom::Start(dst))?;
+                file.write_all(data)?;
+                file.flush()?;
                 Ok(Response::Put)
             }
-            Request::Size => Ok(Response::Size(self.file.metadata()?.len())),
+            Request::Size => {
+                let file = self.file()?;
+                Ok(Response::Size(file.metadata()?.len()))
+            }
             Request::SetLen { len } => {
-                self.file.set_len(len)?;
+                let file = self.file()?;
+                file.set_len(len)?;
                 Ok(Response::SetLen)
             }
             Request::Reserved => {
@@ -652,5 +679,16 @@ fn normalize_path(path: &Path) -> PathBuf {
 impl Default for WalIndexLockState {
     fn default() -> Self {
         WalIndexLockState::Shared { count: 0 }
+    }
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            next_id: Default::default(),
+            file_locks: Default::default(),
+            wal_indices: Default::default(),
+            files: Arc::new(Mutex::new(LruCache::new(64))),
+        }
     }
 }
