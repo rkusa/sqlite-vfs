@@ -529,7 +529,7 @@ mod vfs {
         let name = name.to_bytes_with_nul();
         if name.len() > n_out as usize || name.len() > MAX_PATH_LENGTH {
             return state.set_last_error(
-                ffi::SQLITE_ERROR,
+                ffi::SQLITE_CANTOPEN,
                 std::io::Error::new(ErrorKind::Other, "full pathname is too long"),
             );
         }

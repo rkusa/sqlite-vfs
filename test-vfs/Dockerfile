@@ -63,6 +63,12 @@ RUN rm sqlite-src-3370200/test/loadext2.test
 # implementation so it is not forth waiting for them.
 RUN rm sqlite-src-3370200/test/backup_ioerr.test
 
+# Remove tests from misc7 that only test file-system specific behaviour which don't contribute
+# to the test coverage of a custom VFS such as the OS running out of file descriptors and trying
+# to write a file on disk that is read-only.
+COPY patch/test/misc7.test.patch misc7.test.patch
+RUN patch sqlite-src-3370200/test/misc7.test misc7.test.patch && rm misc7.test.patch
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 

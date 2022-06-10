@@ -111,6 +111,7 @@ impl Server {
             Some(Request::Open { access, db }) => {
                 let path = normalize_path(Path::new(&db));
                 if path.is_dir() {
+                    conn.send(Response::Denied)?;
                     return Ok(());
                 }
 
