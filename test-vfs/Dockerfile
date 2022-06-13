@@ -46,7 +46,6 @@ RUN rm sqlite-src-3370200/test/journal3.test
 
 # Remove e_walauto.test as it requires an actually memory mapped wal index
 RUN rm sqlite-src-3370200/test/e_walauto.test
-RUN rm sqlite-src-3370200/test/mmap2.test
 RUN rm sqlite-src-3370200/test/mmapwarm.test
 
 # Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
@@ -68,6 +67,11 @@ RUN rm sqlite-src-3370200/test/backup_ioerr.test
 # to write a file on disk that is read-only.
 COPY patch/test/misc7.test.patch misc7.test.patch
 RUN patch sqlite-src-3370200/test/misc7.test misc7.test.patch && rm misc7.test.patch
+
+# Remove tests that expect `xSetSystemCall`, which is not implemented.
+RUN rm sqlite-src-3370200/test/mmap2.test
+RUN rm sqlite-src-3370200/test/syscall.test
+RUN rm sqlite-src-3370200/test/sysfault.test
 
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
