@@ -374,7 +374,7 @@ mod vfs {
             if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
                 // Try again as readonly
                 opts.access = OpenAccess::Read;
-                state.vfs.open(&name, opts.clone())
+                state.vfs.open(&name, opts.clone()).map_err(|_| err)
             } else {
                 Err(err)
             }
