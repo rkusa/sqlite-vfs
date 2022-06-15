@@ -295,7 +295,10 @@ struct FileExt<V, F> {
     db_name: String,
     file: F,
     delete_on_close: bool,
+    /// The last error; shared with the VFS.
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
+    /// The last error number of this file/connection (not shared with the VFS).
+    last_errno: i32,
     wal_index: HashMap<u32, Pin<Box<[u8; 32768]>>>,
     wal_index_locks: HashMap<u8, WalIndexLock>,
     has_exclusive_lock: bool,
@@ -402,6 +405,7 @@ mod vfs {
             file,
             delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
+            last_errno: 0,
             wal_index: Default::default(),
             wal_index_locks: Default::default(),
             has_exclusive_lock: false,
@@ -769,7 +773,7 @@ mod io {
         match result {
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::WriteZero => {
-                return state.set_last_error(ffi::SQLITE_FULL, err)
+                return ffi::SQLITE_FULL;
             }
             Err(err) => return state.set_last_error(ffi::SQLITE_IOERR_WRITE, err),
         }
@@ -1572,6 +1576,7 @@ impl<V, F> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
         // log::error!("{}", err);
         *(self.last_error.lock().unwrap()) = Some((no, err));
+        self.last_errno = no;
         no
     }
 }
