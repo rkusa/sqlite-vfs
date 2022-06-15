@@ -73,6 +73,9 @@ RUN rm sqlite-src-3370200/test/mmap2.test
 RUN rm sqlite-src-3370200/test/syscall.test
 RUN rm sqlite-src-3370200/test/sysfault.test
 
+# Remove tests that only test a specific built-in VFS
+RUN rm sqlite-src-3370200/test/unixexcl.test
+
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
