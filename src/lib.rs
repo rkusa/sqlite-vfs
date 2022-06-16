@@ -1058,6 +1058,15 @@ mod io {
                 // #[cfg(feature = "sqlite_test")]
                 // let _benign = simulate_io_error_benign();
 
+                let current = match state.file.size() {
+                    Ok(size) => size,
+                    Err(err) => return state.set_last_error(ffi::SQLITE_ERROR, err),
+                };
+
+                if current > size_hint {
+                    return ffi::SQLITE_OK;
+                }
+
                 if let Some(chunk_size) = state.chunk_size {
                     let chunk_size = chunk_size as u64;
                     let size = ((size_hint + chunk_size - 1) / chunk_size) * chunk_size;
