@@ -445,7 +445,7 @@ mod vfs {
             Ok(_) => ffi::SQLITE_OK,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
-                    ffi::SQLITE_OK
+                    ffi::SQLITE_IOERR_DELETE_NOENT
                 } else {
                     state.set_last_error(ffi::SQLITE_DELETE, err)
                 }

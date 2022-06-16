@@ -35,14 +35,14 @@ impl Client {
             conn: Connection::new(stream),
         };
         let res = client.send(Request::Delete { db })?;
-        if res != Response::Delete {
-            return Err(io::Error::new(
+        match res {
+            Response::Delete => Ok(()),
+            Response::Denied => Err(ErrorKind::NotFound.into()),
+            _ => Err(io::Error::new(
                 ErrorKind::Other,
                 "received unexpected response",
-            ));
+            )),
         }
-
-        Ok(())
     }
 
     pub fn exists(addr: impl ToSocketAddrs, db: &str) -> io::Result<bool> {

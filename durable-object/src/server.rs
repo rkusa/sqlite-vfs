@@ -221,10 +221,10 @@ impl Server {
                 let mut file_locks = self.file_locks.write().unwrap();
                 file_locks.remove(&path);
                 match fs::remove_file(path) {
-                    Err(err) if err.kind() != ErrorKind::NotFound => return Err(err),
-                    _ => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => conn.send(Response::Denied)?,
+                    Err(err) => return Err(err),
+                    Ok(()) => conn.send(Response::Delete)?,
                 }
-                conn.send(Response::Delete)?;
                 Ok(())
             }
             Some(Request::Exists { db }) => {
