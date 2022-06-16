@@ -117,12 +117,18 @@ impl Server {
                     return Ok(());
                 }
 
+                // Database file might have been deleted externally (e.g. from tests). This is why
+                // the existence is checked and later on used to decide whether to reset certain
+                // states.
+                let exists = path.is_file();
+
                 let file_lock = {
                     let mut objects = self.file_locks.write().unwrap();
                     match objects.entry(path.clone()) {
                         Entry::Occupied(mut entry) => {
+                            // database file got deleted by test, reset its lock states
                             let w = entry.get();
-                            if let Some(a) = w.upgrade() {
+                            if let Some(a) = exists.then(|| w.upgrade()).flatten() {
                                 a
                             } else {
                                 let a: Arc<_> = Default::default();
@@ -143,6 +149,12 @@ impl Server {
                         Entry::Occupied(mut entry) => {
                             let w = entry.get();
                             if let Some(a) = w.upgrade() {
+                                // database file got deleted by test, reset its wal indices
+                                if !exists {
+                                    let mut wal_index = a.lock().unwrap();
+                                    wal_index.data.clear();
+                                    wal_index.locks.clear();
+                                }
                                 a
                             } else {
                                 let a: Arc<_> = Default::default();
