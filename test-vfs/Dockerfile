@@ -61,6 +61,12 @@ RUN rm sqlite-src-3370200/test/loadext2.test
 # Remove long running tests that while being green, don't contribute tests relevant for a VFS
 # implementation so it is not forth waiting for them.
 RUN rm sqlite-src-3370200/test/backup_ioerr.test
+RUN rm sqlite-src-3370200/test/speed1.test
+RUN rm sqlite-src-3370200/test/speed1p.test
+RUN rm sqlite-src-3370200/test/speed2.test
+RUN rm sqlite-src-3370200/test/speed3.test
+RUN rm sqlite-src-3370200/test/speed4.test
+RUN rm sqlite-src-3370200/test/speed4p.test
 
 # Remove tests from misc7 that only test file-system specific behaviour which don't contribute
 # to the test coverage of a custom VFS such as the OS running out of file descriptors and trying
