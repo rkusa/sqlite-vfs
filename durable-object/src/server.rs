@@ -364,6 +364,22 @@ impl FileConnection {
                     }
                 }
                 wal_index.data.insert(region, *data);
+
+                // Some tests rely on the size of the `.db-shm` file, thus make sure it grows
+                let shm =
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(self.path.with_extension(format!(
+                            "{}-shm",
+                            self.path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("db")
+                        )))?;
+                let size = wal_index.data.keys().max().cloned().unwrap_or(0) * 32768;
+                shm.set_len(size as u64)?;
+
                 Ok(Response::PutWalIndex)
             }
             Request::LockWalIndex { locks, lock: to } => {
@@ -401,7 +417,14 @@ impl FileConnection {
                 let mut wal_index = self.wal_index.lock().unwrap();
                 wal_index.data.clear();
                 wal_index.locks.clear();
-                fs::remove_file(self.path.with_extension("db-shm")).ok();
+                fs::remove_file(self.path.with_extension(format!(
+                            "{}-shm",
+                            self.path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("db")
+                        )))
+                .ok();
                 Ok(Response::DeleteWalIndex)
             }
             Request::Moved => {
