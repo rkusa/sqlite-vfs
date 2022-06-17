@@ -147,17 +147,22 @@ impl sqlite_vfs::DatabaseHandle for Connection {
         }
     }
 
-    fn is_reserved(&self) -> Result<bool, std::io::Error> {
+    fn reserved(&self) -> Result<bool, std::io::Error> {
         if self.lock > Lock::Shared {
             return Ok(true);
         }
 
         let mut client = self.client.lock().unwrap();
-        client.is_reserved()
+        client.reserved()
     }
 
     fn current_lock(&self) -> Result<Lock, std::io::Error> {
         Ok(self.lock)
+    }
+
+    fn moved(&self) -> Result<bool, std::io::Error> {
+        let mut client = self.client.lock().unwrap();
+        client.moved()
     }
 }
 

@@ -40,6 +40,7 @@ pub enum Request<'a> {
         lock: WalIndexLock,
     },
     DeleteWalIndex,
+    Moved,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -207,6 +208,7 @@ impl<'a> Request<'a> {
                 })
             }
             13 => Ok(Request::DeleteWalIndex),
+            14 => Ok(Request::Moved),
             type_ => Err(std::io::Error::new(
                 ErrorKind::Other,
                 format!("invalid request type `{}`", type_),
@@ -270,6 +272,9 @@ impl<'a> Request<'a> {
             }
             Request::DeleteWalIndex => {
                 buffer.extend_from_slice(&13u16.to_be_bytes()); // type
+            }
+            Request::Moved => {
+                buffer.extend_from_slice(&14u16.to_be_bytes()); // type
             }
         }
     }
@@ -418,6 +423,14 @@ mod tests {
     #[test]
     fn test_request_delete_wal_index_encode_decode() {
         let req = Request::DeleteWalIndex;
+        let mut encoded = Vec::new();
+        req.encode(&mut encoded);
+        assert_eq!(Request::decode(&encoded).unwrap(), req);
+    }
+
+    #[test]
+    fn test_request_moved_encode_decode() {
+        let req = Request::Moved;
         let mut encoded = Vec::new();
         req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);

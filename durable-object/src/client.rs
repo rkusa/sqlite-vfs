@@ -120,7 +120,7 @@ impl Client {
         Ok(())
     }
 
-    pub fn is_reserved(&mut self) -> io::Result<bool> {
+    pub fn reserved(&mut self) -> io::Result<bool> {
         let res = self.send(Request::Reserved)?;
         if let Response::Reserved(reserved) = res {
             Ok(reserved)
@@ -190,5 +190,17 @@ impl Client {
         log::trace!("received {:?}", res);
 
         Ok(res)
+    }
+
+    pub fn moved(&mut self) -> io::Result<bool> {
+        let res = self.send(Request::Moved)?;
+        if let Response::Moved(moved) = res {
+            Ok(moved)
+        } else {
+            Err(io::Error::new(
+                ErrorKind::Other,
+                "received unexpected response",
+            ))
+        }
     }
 }

@@ -21,6 +21,7 @@ pub enum Response<'a> {
     PutWalIndex,
     LockWalIndex,
     DeleteWalIndex,
+    Moved(bool),
 }
 
 impl<'a> Response<'a> {
@@ -78,6 +79,7 @@ impl<'a> Response<'a> {
             11 => Ok(Response::PutWalIndex),
             12 => Ok(Response::LockWalIndex),
             13 => Ok(Response::DeleteWalIndex),
+            14 => Ok(Response::Moved(data.get(2) == Some(&1))),
             type_ => Err(std::io::Error::new(
                 ErrorKind::Other,
                 format!("invalid response type `{}`", type_),
@@ -119,6 +121,10 @@ impl<'a> Response<'a> {
             Response::PutWalIndex => buffer.extend_from_slice(&11u16.to_be_bytes()),
             Response::LockWalIndex => buffer.extend_from_slice(&12u16.to_be_bytes()),
             Response::DeleteWalIndex => buffer.extend_from_slice(&13u16.to_be_bytes()),
+            Response::Moved(moved) => {
+                buffer.extend_from_slice(&14u16.to_be_bytes());
+                buffer.extend_from_slice(&[if *moved { 1 } else { 0 }]);
+            }
         }
     }
 }
@@ -237,6 +243,14 @@ mod tests {
     #[test]
     fn test_response_delete_wal_index_encode_decode() {
         let res = Response::DeleteWalIndex;
+        let mut encoded = Vec::new();
+        res.encode(&mut encoded);
+        assert_eq!(Response::decode(&encoded).unwrap(), res);
+    }
+
+    #[test]
+    fn test_response_moved_encode_decode() {
+        let res = Response::Moved(true);
         let mut encoded = Vec::new();
         res.encode(&mut encoded);
         assert_eq!(Response::decode(&encoded).unwrap(), res);

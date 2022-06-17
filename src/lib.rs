@@ -57,7 +57,7 @@ where
 
     /// Check if the database this handle points to holds a [Lock::Reserved], [Lock::Pending] or
     /// [Lock::Exclusive] lock.
-    fn is_reserved(&self) -> Result<bool, std::io::Error>;
+    fn reserved(&self) -> Result<bool, std::io::Error>;
 
     /// Return the current [Lock] of the this handle.
     fn current_lock(&self) -> Result<Lock, std::io::Error>;
@@ -65,6 +65,12 @@ where
     /// Change the chunk size of the database to `chunk_size`.
     fn set_chunk_size(&self, _chunk_size: usize) -> Result<(), std::io::Error> {
         Ok(())
+    }
+
+    /// Check if the underlying data of the handle got moved or deleted. When moved, the handle can
+    /// still be read from, but not written to anymore.
+    fn moved(&self) -> Result<bool, std::io::Error> {
+        Ok(false)
     }
 }
 
@@ -974,7 +980,7 @@ mod io {
         //     return ffi::SQLITE_IOERR_CHECKRESERVEDLOCK;
         // }
 
-        if let Err(err) = state.file.is_reserved().and_then(|is_reserved| {
+        if let Err(err) = state.file.reserved().and_then(|is_reserved| {
             let p_res_out: &mut c_int = p_res_out.as_mut().ok_or_else(null_ptr_error)?;
             *p_res_out = is_reserved as c_int;
             Ok(())
@@ -996,8 +1002,6 @@ mod io {
             Err(_) => return ffi::SQLITE_NOTFOUND,
         };
         log::trace!("[{}] file_control op={} ({})", state.id, op, state.db_name);
-
-        // eprintln!("file_control: {}", op);
 
         // Docs: https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html
         match op {
@@ -1171,8 +1175,16 @@ mod io {
             }
 
             // Check whether or not the file has been renamed, moved, or deleted since it was first
-            // opened. Not implemented.
-            ffi::SQLITE_FCNTL_HAS_MOVED => ffi::SQLITE_NOTFOUND,
+            // opened.
+            ffi::SQLITE_FCNTL_HAS_MOVED => match state.file.moved() {
+                Ok(moved) => {
+                    if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                        *p_arg = moved as i32;
+                    }
+                    ffi::SQLITE_OK
+                }
+                Err(err) => state.set_last_error(ffi::SQLITE_ERROR, err),
+            },
 
             // Sent to the VFS immediately before the xSync method is invoked on a database file
             // descriptor. Silently ignored.
