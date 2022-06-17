@@ -78,6 +78,7 @@ RUN patch sqlite-src-3370200/test/misc7.test misc7.test.patch && rm misc7.test.p
 RUN rm sqlite-src-3370200/test/mmap2.test
 RUN rm sqlite-src-3370200/test/syscall.test
 RUN rm sqlite-src-3370200/test/sysfault.test
+RUN rm sqlite-src-3370200/test/wal64k.test
 
 # Remove tests that only test a specific built-in VFS
 RUN rm sqlite-src-3370200/test/unixexcl.test
