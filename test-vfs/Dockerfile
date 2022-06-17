@@ -79,6 +79,9 @@ RUN rm sqlite-src-3370200/test/unixexcl.test
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
+# Increase limit of concurrently open files
+RUN echo "sqlite  soft  nofile  2048" >> /etc/security/limits.conf
+
 WORKDIR /github/workspace
 COPY entrypoint.sh /
 ENTRYPOINT ["/entrypoint.sh"]

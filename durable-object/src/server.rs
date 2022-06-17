@@ -166,7 +166,7 @@ impl Server {
                     }
                 };
 
-                let mut o = fs::OpenOptions::new();
+                let mut o = OpenOptions::new();
                 o.read(true).write(access != OpenAccess::Read);
                 match access {
                     OpenAccess::Create => {
@@ -402,12 +402,7 @@ impl FileConnection {
                 Ok(Response::DeleteWalIndex)
             }
             Request::Moved => {
-                let ino = OpenOptions::new()
-                    .read(true)
-                    .open(&self.path)
-                    .and_then(|f| f.metadata())
-                    .map(|m| m.ino())
-                    .unwrap_or(0);
+                let ino = fs::metadata(&self.path).map(|m| m.ino()).unwrap_or(0);
                 Ok(Response::Moved(ino == 0 || ino != self.file_ino))
             }
         }
