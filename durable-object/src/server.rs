@@ -253,7 +253,10 @@ impl ServerConnection {
 impl FileConnection {
     fn handle(mut self, mut conn: ServerConnection) -> io::Result<()> {
         while let Some(req) = conn.receive()? {
-            let res = self.handle_request(req)?;
+            let res = self.handle_request(req).unwrap_or_else(|_err| {
+                // log::error!("error while handling request: {}", err);
+                Response::Denied
+            });
             conn.send(res)?;
         }
 
