@@ -1,15 +1,15 @@
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::size_of;
-use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 
 pub struct Connection {
-    stream: TcpStream,
+    stream: UnixStream,
     send_buffer: Vec<u8>,
     recv_buffer: Vec<u8>,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: UnixStream) -> Self {
         Connection {
             stream,
             send_buffer: Vec::with_capacity(8192),
@@ -87,16 +87,16 @@ pub mod asynchronous {
     use std::mem::size_of;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use tokio::net::UnixStream;
 
     pub struct Connection {
-        stream: TcpStream,
+        stream: UnixStream,
         send_buffer: Vec<u8>,
         recv_buffer: Vec<u8>,
     }
 
     impl Connection {
-        pub fn new(stream: TcpStream) -> Self {
+        pub fn new(stream: UnixStream) -> Self {
             Connection {
                 stream,
                 send_buffer: Vec::with_capacity(8192),

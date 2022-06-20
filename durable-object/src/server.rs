@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::AtomicUsize;
 
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task;
 
 use crate::connection::asynchronous::Connection;
@@ -66,12 +66,13 @@ struct ServerConnection {
 }
 
 impl Server {
-    pub async fn start(self, addr: impl ToSocketAddrs) -> io::Result<()> {
+    pub async fn start(self, path: impl AsRef<Path>) -> io::Result<()> {
         let server = Rc::new(self);
-        let listener = TcpListener::bind(addr).await?;
+        let path = path.as_ref();
+        let listener = UnixListener::bind(path)?;
         log::info!(
-            "listening to {} (cwd: {:?})",
-            listener.local_addr().unwrap(),
+            "listening on UDS `{:?}` (cwd: {:?})",
+            path,
             std::env::current_dir().unwrap()
         );
 
@@ -85,8 +86,6 @@ impl Server {
                     let (stream, _) = listener.accept().await?;
                     log::trace!("received new client connection");
 
-                    stream.set_nodelay(true)?;
-
                     let server = server.clone();
                     task::spawn_local(async move {
                         if let Err(err) = server.handle_client(stream).await {
@@ -98,7 +97,7 @@ impl Server {
             .await
     }
 
-    async fn handle_client(self: Rc<Server>, stream: TcpStream) -> io::Result<()> {
+    async fn handle_client(self: Rc<Server>, stream: UnixStream) -> io::Result<()> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

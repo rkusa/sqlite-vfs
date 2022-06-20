@@ -1,6 +1,7 @@
 use std::io::{self, ErrorKind};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::ops::Range;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 use crate::connection::Connection;
 use crate::request::{Lock, Request, WalIndexLock};
@@ -11,9 +12,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn connect(addr: impl ToSocketAddrs, db: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
+    pub fn connect(path: impl AsRef<Path>, db: &str) -> io::Result<Self> {
+        let stream = UnixStream::connect(path)?;
         let mut client = Client {
             conn: Connection::new(stream),
         };

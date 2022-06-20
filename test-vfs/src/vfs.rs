@@ -39,7 +39,7 @@ impl Vfs for TestVfs {
             return Err(io::Error::new(ErrorKind::Other, "cannot open directory"));
         }
 
-        let client = Mutex::new(Client::connect("127.0.0.1:6000", db)?);
+        let client = Mutex::new(Client::connect("/tmp/test-vfs-sock", db)?);
 
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
