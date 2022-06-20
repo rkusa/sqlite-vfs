@@ -31,7 +31,7 @@ where
     fn size(&self) -> Result<u64, std::io::Error>;
 
     /// Reads the exact number of byte required to fill `buf` from the given `offset`.
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error>;
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error>;
 
     /// Attempts to write an entire `buf` starting from the given `offset`.
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error>;

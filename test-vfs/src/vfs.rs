@@ -1,5 +1,7 @@
 use std::borrow::Cow;
-use std::io::{ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -18,6 +20,9 @@ pub struct TestVfs {
 pub struct Connection {
     client: Mutex<Client>,
     lock: Lock,
+    path: PathBuf,
+    file: File,
+    file_ino: u64,
 }
 
 pub struct WalConnection;
@@ -26,28 +31,46 @@ impl Vfs for TestVfs {
     type Handle = Connection;
 
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
-        // TODO: open options
+        let path = normalize_path(Path::new(&db));
+        if path.is_dir() {
+            if matches!(opts.access, OpenAccess::Create | OpenAccess::CreateNew) {
+                return Err(ErrorKind::PermissionDenied.into());
+            }
+            return Err(io::Error::new(ErrorKind::Other, "cannot open directory"));
+        }
+
+        let client = Mutex::new(Client::connect("127.0.0.1:6000", db)?);
+
+        let mut o = fs::OpenOptions::new();
+        o.read(true).write(opts.access != OpenAccess::Read);
+        match opts.access {
+            OpenAccess::Create => {
+                o.create(true);
+            }
+            OpenAccess::CreateNew => {
+                o.create_new(true);
+            }
+            _ => {}
+        }
+        let file = o.open(&path)?;
+        let file_ino = file.metadata()?.ino();
+
         Ok(Connection {
-            client: Mutex::new(Client::connect(
-                "127.0.0.1:6000",
-                db,
-                match opts.access {
-                    OpenAccess::Read => durable_object::request::OpenAccess::Read,
-                    OpenAccess::Write => durable_object::request::OpenAccess::Write,
-                    OpenAccess::Create => durable_object::request::OpenAccess::Create,
-                    OpenAccess::CreateNew => durable_object::request::OpenAccess::CreateNew,
-                },
-            )?),
+            client,
             lock: Lock::default(),
+            path,
+            file,
+            file_ino,
         })
     }
 
     fn delete(&self, db: &str) -> Result<(), std::io::Error> {
-        Client::delete("127.0.0.1:6000", db)
+        let path = normalize_path(Path::new(&db));
+        fs::remove_file(path)
     }
 
     fn exists(&self, db: &str) -> Result<bool, std::io::Error> {
-        Client::exists("127.0.0.1:6000", db)
+        Ok(Path::new(db).is_file())
     }
 
     fn temporary_name(&self) -> String {
@@ -86,38 +109,34 @@ impl sqlite_vfs::DatabaseHandle for Connection {
     type WalIndex = WalConnection;
 
     fn size(&self) -> Result<u64, std::io::Error> {
-        let mut client = self.client.lock().unwrap();
-        client.size()
+        self.file.metadata().map(|m| m.len())
     }
 
-    fn read_exact_at(&self, mut buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
-        let mut client = self.client.lock().unwrap();
-        let data = client.get(offset..(offset + buf.len() as u64))?;
-        buf.write_all(data)?;
-        if data.len() < buf.len() {
-            return Err(ErrorKind::UnexpectedEof.into());
-        }
-
-        Ok(())
+    fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), std::io::Error> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(buf)
     }
 
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), std::io::Error> {
-        let mut client = self.client.lock().unwrap();
-        client.put(offset, buf)
-    }
-
-    fn sync(&mut self, _data_only: bool) -> Result<(), std::io::Error> {
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(buf)?;
         Ok(())
     }
 
-    fn set_len(&mut self, size: u64) -> Result<(), std::io::Error> {
-        let mut client = self.client.lock().unwrap();
-        client.set_len(size)
+    fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error> {
+        if data_only {
+            self.file.sync_data()
+        } else {
+            self.file.sync_all()
+        }
+    }
+
+    fn set_len(&mut self, len: u64) -> Result<(), std::io::Error> {
+        self.file.set_len(len)
     }
 
     fn lock(&mut self, to: sqlite_vfs::Lock) -> Result<bool, std::io::Error> {
         // eprintln!("lock {}:", self.path.to_string_lossy());
-
         // eprintln!("    {:?}: {:?} -> {:?}", state, self.lock, to);
 
         // If there is already a lock of the requested type, do nothing.
@@ -161,8 +180,8 @@ impl sqlite_vfs::DatabaseHandle for Connection {
     }
 
     fn moved(&self) -> Result<bool, std::io::Error> {
-        let mut client = self.client.lock().unwrap();
-        client.moved()
+        let ino = fs::metadata(&self.path).map(|m| m.ino()).unwrap_or(0);
+        Ok(ino == 0 || ino != self.file_ino)
     }
 }
 
@@ -190,7 +209,12 @@ impl WalIndex<Connection> for WalConnection {
 
     fn delete(handle: &mut Connection) -> Result<(), std::io::Error> {
         let mut client = handle.client.lock().unwrap();
-        client.delete_wal_index()
+        client.delete_wal_index()?;
+
+        let shm_path = Self::shm_path(handle);
+        fs::remove_file(shm_path).ok();
+
+        Ok(())
     }
 
     fn pull(
@@ -198,6 +222,13 @@ impl WalIndex<Connection> for WalConnection {
         region: u32,
         data: &mut [u8; 32768],
     ) -> Result<(), std::io::Error> {
+        // Some tests rely on the existence of the `.db-shm` file, thus make sure it exists,
+        // even though it isn't actually used for anything.
+        let shm_path = Self::shm_path(handle);
+        if !shm_path.is_file() {
+            fs::write(shm_path, "")?;
+        }
+
         let mut client = handle.client.lock().unwrap();
         let new_data = client.get_wal_index(region)?;
         data.copy_from_slice(&new_data[..]);
@@ -210,7 +241,33 @@ impl WalIndex<Connection> for WalConnection {
         data: &[u8; 32768],
     ) -> Result<(), std::io::Error> {
         let mut client = handle.client.lock().unwrap();
-        client.put_wal_index(region, data)
+        client.put_wal_index(region, data)?;
+
+        // Some tests rely on the size of the `.db-shm` file, thus make sure it grows
+        let shm_path = Self::shm_path(handle);
+        let shm = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shm_path)?;
+        let size = region as u64 * 32768;
+        if shm.metadata()?.size() < size {
+            shm.set_len(size as u64)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl WalConnection {
+    fn shm_path(handle: &Connection) -> PathBuf {
+        handle.path.with_extension(format!(
+            "{}-shm",
+            handle
+                .path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("db")
+        ))
     }
 }
 
