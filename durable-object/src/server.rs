@@ -1,18 +1,14 @@
-// Implementation notes:
-// - The following code is on purpose not using `tokio::fs` as simply blocking on file access ended
-//   up being faster for this particular use-case (of a VFS only targeted for tests) than offloading
-//   file access to worker threads.
-
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, SeekFrom};
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::AtomicUsize;
 
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::task;
 
@@ -190,7 +186,7 @@ impl Server {
                     }
                     _ => {}
                 }
-                let file = match o.open(&path) {
+                let file = match o.open(&path).await {
                     Ok(f) => {
                         conn.send(Response::Open).await?;
                         f
@@ -201,7 +197,7 @@ impl Server {
                         return Ok(());
                     }
                 };
-                let file_ino = file.metadata()?.ino();
+                let file_ino = file.metadata().await?.ino();
 
                 let file_conn = FileConnection {
                     id,
@@ -224,7 +220,7 @@ impl Server {
                     let mut file_locks = self.file_locks.borrow_mut();
                     file_locks.remove(&path);
                 }
-                match fs::remove_file(path) {
+                match fs::remove_file(path).await {
                     Err(err) if err.kind() == ErrorKind::NotFound => {
                         conn.send(Response::Denied).await?
                     }
@@ -272,7 +268,7 @@ impl ServerConnection {
 impl FileConnection {
     async fn handle(mut self, mut conn: ServerConnection) -> io::Result<()> {
         while let Some(req) = conn.receive().await? {
-            let res = self.handle_request(req).unwrap_or_else(|_err| {
+            let res = self.handle_request(req).await.unwrap_or_else(|_err| {
                 // log::error!("error while handling request: {}", err);
                 Response::Denied
             });
@@ -282,7 +278,7 @@ impl FileConnection {
         Ok(())
     }
 
-    fn handle_request(&mut self, req: Request) -> io::Result<Response> {
+    async fn handle_request<'a, 'b>(&'a mut self, req: Request<'b>) -> io::Result<Response<'a>> {
         match req {
             Request::Open { .. } | Request::Delete { .. } | Request::Exists { .. } => {
                 Ok(Response::Denied)
@@ -311,13 +307,13 @@ impl FileConnection {
                 }
             }
             Request::Get { src } => {
-                self.file.seek(SeekFrom::Start(src.start))?;
+                self.file.seek(SeekFrom::Start(src.start)).await?;
 
                 self.buffer.resize((src.end - src.start) as usize, 0);
                 self.buffer.shrink_to((src.end - src.start) as usize);
                 let mut offset = 0;
                 while offset < self.buffer.len() {
-                    match self.file.read(&mut self.buffer[offset..]) {
+                    match self.file.read(&mut self.buffer[offset..]).await {
                         Ok(0) => break,
                         Ok(n) => {
                             offset += n;
@@ -331,14 +327,14 @@ impl FileConnection {
                 Ok(Response::Get(&self.buffer))
             }
             Request::Put { dst, data } => {
-                self.file.seek(SeekFrom::Start(dst))?;
-                self.file.write_all(data)?;
-                self.file.flush()?;
+                self.file.seek(SeekFrom::Start(dst)).await?;
+                self.file.write_all(data).await?;
+                self.file.flush().await?;
                 Ok(Response::Put)
             }
-            Request::Size => Ok(Response::Size(self.file.metadata()?.len())),
+            Request::Size => Ok(Response::Size(self.file.metadata().await?.len())),
             Request::SetLen { len } => {
-                self.file.set_len(len)?;
+                self.file.set_len(len).await?;
                 Ok(Response::SetLen)
             }
             Request::Reserved => {
@@ -351,11 +347,9 @@ impl FileConnection {
                 )))
             }
             Request::GetWalIndex { region } => {
-                let mut wal_index = self.wal_index.borrow_mut();
-
                 // Some tests rely on the existence of the `.db-shm` file, thus make sure it exists,
                 // even though it isn't actually used for anything.
-                if wal_index.data.is_empty() {
+                if self.wal_index.borrow().data.is_empty() {
                     fs::write(
                         self.path.with_extension(format!(
                             "{}-shm",
@@ -365,9 +359,11 @@ impl FileConnection {
                                 .unwrap_or("db")
                         )),
                         "",
-                    )?;
+                    )
+                    .await?;
                 }
 
+                let mut wal_index = self.wal_index.borrow_mut();
                 let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
                 self.buffer.resize(32768, 0);
                 (&mut self.buffer[..32768]).copy_from_slice(&data[..]);
@@ -376,28 +372,38 @@ impl FileConnection {
                 ))
             }
             Request::PutWalIndex { region, data } => {
-                let mut wal_index = self.wal_index.borrow_mut();
-                if let Some(previous) = wal_index.data.get(&region) {
-                    if previous == data {
-                        // log::error!("{{{}}} unnecessary index write!", self.id);
+                {
+                    let mut wal_index = self.wal_index.borrow_mut();
+                    if let Some(previous) = wal_index.data.get(&region) {
+                        if previous == data {
+                            // log::error!("{{{}}} unnecessary index write!", self.id);
+                        }
                     }
+                    wal_index.data.insert(region, *data);
                 }
-                wal_index.data.insert(region, *data);
 
                 // Some tests rely on the size of the `.db-shm` file, thus make sure it grows
-                let shm =
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(self.path.with_extension(format!(
+                let shm = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(self.path.with_extension(format!(
                             "{}-shm",
                             self.path
                                 .extension()
                                 .and_then(|ext| ext.to_str())
                                 .unwrap_or("db")
-                        )))?;
-                let size = wal_index.data.keys().max().cloned().unwrap_or(0) * 32768;
-                shm.set_len(size as u64)?;
+                        )))
+                    .await?;
+                let size = self
+                    .wal_index
+                    .borrow()
+                    .data
+                    .keys()
+                    .max()
+                    .cloned()
+                    .unwrap_or(0)
+                    * 32768;
+                shm.set_len(size as u64).await?;
 
                 Ok(Response::PutWalIndex)
             }
@@ -433,9 +439,11 @@ impl FileConnection {
                 Ok(Response::LockWalIndex)
             }
             Request::DeleteWalIndex => {
-                let mut wal_index = self.wal_index.borrow_mut();
-                wal_index.data.clear();
-                wal_index.locks.clear();
+                {
+                    let mut wal_index = self.wal_index.borrow_mut();
+                    wal_index.data.clear();
+                    wal_index.locks.clear();
+                }
                 fs::remove_file(self.path.with_extension(format!(
                             "{}-shm",
                             self.path
@@ -443,11 +451,12 @@ impl FileConnection {
                                 .and_then(|ext| ext.to_str())
                                 .unwrap_or("db")
                         )))
+                .await
                 .ok();
                 Ok(Response::DeleteWalIndex)
             }
             Request::Moved => {
-                let ino = fs::metadata(&self.path).map(|m| m.ino()).unwrap_or(0);
+                let ino = fs::metadata(&self.path).await.map(|m| m.ino()).unwrap_or(0);
                 Ok(Response::Moved(ino == 0 || ino != self.file_ino))
             }
         }

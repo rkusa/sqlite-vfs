@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, tests-async-fs]
   pull_request:
     branches: [main]
 
