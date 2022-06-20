@@ -1,16 +1,24 @@
+// Implementation notes:
+// - The following code is on purpose not using `tokio::fs` as simply blocking on file access ended
+//   up being faster for this particular use-case (of a VFS only targeted for tests) than offloading
+//   file access to worker threads.
+
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
-use crate::connection::Connection;
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::task;
+
+use crate::connection::asynchronous::Connection;
 use crate::request::{OpenAccess, WalIndexLock};
 
 use super::request::{Lock, Request};
@@ -20,9 +28,9 @@ use super::response::Response;
 pub struct Server {
     next_id: AtomicUsize,
     #[allow(clippy::type_complexity)]
-    file_locks: Arc<RwLock<HashMap<PathBuf, Weak<RwLock<FileLockState>>>>>,
+    file_locks: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<FileLockState>>>>>,
     #[allow(clippy::type_complexity)]
-    wal_indices: Arc<RwLock<HashMap<PathBuf, Weak<Mutex<WalIndex>>>>>,
+    wal_indices: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<WalIndex>>>>>,
 }
 
 pub struct FileConnection {
@@ -30,10 +38,10 @@ pub struct FileConnection {
     path: PathBuf,
     file: File,
     file_ino: u64,
-    file_lock: Arc<RwLock<FileLockState>>,
+    file_lock: Rc<RefCell<FileLockState>>,
     conn_lock: Lock,
     buffer: Vec<u8>,
-    wal_index: Arc<Mutex<WalIndex>>,
+    wal_index: Rc<RefCell<WalIndex>>,
     wal_index_lock: HashMap<u8, WalIndexLock>,
 }
 
@@ -69,34 +77,39 @@ struct ServerConnection {
 }
 
 impl Server {
-    pub fn start(self, addr: impl ToSocketAddrs) -> io::Result<()> {
-        let server = Arc::new(self);
-        let listener = TcpListener::bind(addr)?;
+    pub async fn start(self, addr: impl ToSocketAddrs) -> io::Result<()> {
+        let server = Rc::new(self);
+        let listener = TcpListener::bind(addr).await?;
         log::info!(
             "listening to {} (cwd: {:?})",
             listener.local_addr().unwrap(),
             std::env::current_dir().unwrap()
         );
 
-        // accept connections and process them serially
-        for stream in listener.incoming() {
-            let stream = stream?;
-            log::trace!("received new client connection");
+        let local = task::LocalSet::new();
 
-            stream.set_nodelay(true)?;
+        // Run the local task set.
+        local
+            .run_until(async move {
+                // accept connections and process them serially
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    log::trace!("received new client connection");
 
-            let server = server.clone();
-            std::thread::spawn(move || {
-                if let Err(err) = server.handle_client(stream) {
-                    log::error!("error in connection: {}", err);
+                    stream.set_nodelay(true)?;
+
+                    let server = server.clone();
+                    task::spawn_local(async move {
+                        if let Err(err) = server.handle_client(stream).await {
+                            log::error!("error in connection: {}", err);
+                        }
+                    });
                 }
-            });
-        }
-
-        Ok(())
+            })
+            .await
     }
 
-    fn handle_client(self: Arc<Server>, stream: TcpStream) -> io::Result<()> {
+    async fn handle_client(self: Rc<Server>, stream: TcpStream) -> io::Result<()> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -105,12 +118,12 @@ impl Server {
             inner: Connection::new(stream),
         };
 
-        match conn.receive()? {
+        match conn.receive().await? {
             Some(Request::Open { access, db }) => {
                 let path = normalize_path(Path::new(&db));
                 if path.is_dir() {
                     if matches!(access, OpenAccess::Create | OpenAccess::CreateNew) {
-                        conn.send(Response::Denied)?;
+                        conn.send(Response::Denied).await?;
                     }
                     return Ok(());
                 }
@@ -121,7 +134,7 @@ impl Server {
                 let exists = path.is_file();
 
                 let file_lock = {
-                    let mut objects = self.file_locks.write().unwrap();
+                    let mut objects = self.file_locks.borrow_mut();
                     match objects.entry(path.clone()) {
                         Entry::Occupied(mut entry) => {
                             // database file got deleted by test, reset its lock states
@@ -129,40 +142,40 @@ impl Server {
                             if let Some(a) = exists.then(|| w.upgrade()).flatten() {
                                 a
                             } else {
-                                let a: Arc<_> = Default::default();
-                                entry.insert(Arc::downgrade(&a));
+                                let a: Rc<_> = Default::default();
+                                entry.insert(Rc::downgrade(&a));
                                 a
                             }
                         }
                         Entry::Vacant(entry) => {
-                            let a: Arc<_> = Default::default();
-                            entry.insert(Arc::downgrade(&a));
+                            let a: Rc<_> = Default::default();
+                            entry.insert(Rc::downgrade(&a));
                             a
                         }
                     }
                 };
                 let wal_index = {
-                    let mut objects = self.wal_indices.write().unwrap();
+                    let mut objects = self.wal_indices.borrow_mut();
                     match objects.entry(path.clone()) {
                         Entry::Occupied(mut entry) => {
                             let w = entry.get();
                             if let Some(a) = w.upgrade() {
                                 // database file got deleted by test, reset its wal indices
                                 if !exists {
-                                    let mut wal_index = a.lock().unwrap();
+                                    let mut wal_index = a.borrow_mut();
                                     wal_index.data.clear();
                                     wal_index.locks.clear();
                                 }
                                 a
                             } else {
-                                let a: Arc<_> = Default::default();
-                                entry.insert(Arc::downgrade(&a));
+                                let a: Rc<_> = Default::default();
+                                entry.insert(Rc::downgrade(&a));
                                 a
                             }
                         }
                         Entry::Vacant(entry) => {
-                            let a: Arc<_> = Default::default();
-                            entry.insert(Arc::downgrade(&a));
+                            let a: Rc<_> = Default::default();
+                            entry.insert(Rc::downgrade(&a));
                             a
                         }
                     }
@@ -181,12 +194,12 @@ impl Server {
                 }
                 let file = match o.open(&path) {
                     Ok(f) => {
-                        conn.send(Response::Open)?;
+                        conn.send(Response::Open).await?;
                         f
                     }
                     Err(_err) => {
                         // log::error!("open error: {}", err);
-                        conn.send(Response::Denied)?;
+                        conn.send(Response::Denied).await?;
                         return Ok(());
                     }
                 };
@@ -204,23 +217,27 @@ impl Server {
                     wal_index_lock: Default::default(),
                 };
 
-                file_conn.handle(conn)?;
+                file_conn.handle(conn).await?;
                 Ok(())
             }
             Some(Request::Delete { db }) => {
                 let path = normalize_path(Path::new(&db));
-                let mut file_locks = self.file_locks.write().unwrap();
-                file_locks.remove(&path);
+                {
+                    let mut file_locks = self.file_locks.borrow_mut();
+                    file_locks.remove(&path);
+                }
                 match fs::remove_file(path) {
-                    Err(err) if err.kind() == ErrorKind::NotFound => conn.send(Response::Denied)?,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        conn.send(Response::Denied).await?
+                    }
                     Err(err) => return Err(err),
-                    Ok(()) => conn.send(Response::Delete)?,
+                    Ok(()) => conn.send(Response::Delete).await?,
                 }
                 Ok(())
             }
             Some(Request::Exists { db }) => {
                 let exists = Path::new(db).is_file();
-                conn.send(Response::Exists(exists))?;
+                conn.send(Response::Exists(exists)).await?;
                 Ok(())
             }
             Some(_) => Err(io::Error::new(
@@ -233,8 +250,8 @@ impl Server {
 }
 
 impl ServerConnection {
-    fn receive(&mut self) -> io::Result<Option<Request>> {
-        let res = self.inner.receive()?;
+    async fn receive<'a>(&'a mut self) -> io::Result<Option<Request<'a>>> {
+        let res = self.inner.receive().await?;
         match res {
             Some(res) => {
                 let res = Request::decode(res)?;
@@ -245,21 +262,23 @@ impl ServerConnection {
         }
     }
 
-    fn send(&mut self, req: Response) -> io::Result<()> {
-        self.inner.send(|data: &mut Vec<u8>| req.encode(data))?;
+    async fn send<'a>(&'a mut self, req: Response<'a>) -> io::Result<()> {
+        self.inner
+            .send(|data: &mut Vec<u8>| req.encode(data))
+            .await?;
         log::trace!("{{{}}} sent {:?}", self.id, req);
         Ok(())
     }
 }
 
 impl FileConnection {
-    fn handle(mut self, mut conn: ServerConnection) -> io::Result<()> {
-        while let Some(req) = conn.receive()? {
+    async fn handle(mut self, mut conn: ServerConnection) -> io::Result<()> {
+        while let Some(req) = conn.receive().await? {
             let res = self.handle_request(req).unwrap_or_else(|_err| {
                 // log::error!("error while handling request: {}", err);
                 Response::Denied
             });
-            conn.send(res)?;
+            conn.send(res).await?;
         }
 
         Ok(())
@@ -276,7 +295,7 @@ impl FileConnection {
                     self.id,
                     self.conn_lock,
                     to,
-                    self.file_lock.read().unwrap(),
+                    self.file_lock.borrow(),
                     self.path,
                 );
 
@@ -298,7 +317,7 @@ impl FileConnection {
                         "{{{}}} lock {:?} granted @ {:?} ({:?})",
                         self.id,
                         self.conn_lock,
-                        self.file_lock.read().unwrap(),
+                        self.file_lock.borrow(),
                         self.path
                     );
                     Ok(Response::Lock(self.conn_lock))
@@ -339,7 +358,7 @@ impl FileConnection {
                 Ok(Response::SetLen)
             }
             Request::Reserved => {
-                let file_lock = self.file_lock.read().unwrap();
+                let file_lock = self.file_lock.borrow();
                 Ok(Response::Reserved(matches!(
                     &*file_lock,
                     FileLockState::Pending { .. }
@@ -348,7 +367,7 @@ impl FileConnection {
                 )))
             }
             Request::GetWalIndex { region } => {
-                let mut wal_index = self.wal_index.lock().unwrap();
+                let mut wal_index = self.wal_index.borrow_mut();
 
                 // Some tests rely on the existence of the `.db-shm` file, thus make sure it exists,
                 // even though it isn't actually used for anything.
@@ -373,7 +392,7 @@ impl FileConnection {
                 ))
             }
             Request::PutWalIndex { region, data } => {
-                let mut wal_index = self.wal_index.lock().unwrap();
+                let mut wal_index = self.wal_index.borrow_mut();
                 if let Some(previous) = wal_index.data.get(&region) {
                     if previous == data {
                         // log::error!("{{{}}} unnecessary index write!", self.id);
@@ -399,7 +418,7 @@ impl FileConnection {
                 Ok(Response::PutWalIndex)
             }
             Request::LockWalIndex { locks, lock: to } => {
-                let mut wal_index = self.wal_index.lock().unwrap();
+                let mut wal_index = self.wal_index.borrow_mut();
 
                 // check whether all locks are available
                 for region in locks.clone() {
@@ -430,7 +449,7 @@ impl FileConnection {
                 Ok(Response::LockWalIndex)
             }
             Request::DeleteWalIndex => {
-                let mut wal_index = self.wal_index.lock().unwrap();
+                let mut wal_index = self.wal_index.borrow_mut();
                 wal_index.data.clear();
                 wal_index.locks.clear();
                 fs::remove_file(self.path.with_extension(format!(
@@ -451,7 +470,7 @@ impl FileConnection {
     }
 
     fn lock(&mut self, to: Lock) -> io::Result<bool> {
-        let mut file_lock = self.file_lock.write().unwrap();
+        let mut file_lock = self.file_lock.borrow_mut();
         match (*file_lock, self.conn_lock, to) {
             // Increment reader count when adding new shared lock.
             (
