@@ -12,8 +12,6 @@ use std::os::unix::prelude::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::AtomicUsize;
-use std::thread;
-use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::task;
@@ -298,21 +296,7 @@ impl FileConnection {
                     self.file_lock.borrow(),
                     self.path,
                 );
-
-                let mut ok = self.lock(to)?;
-                if !ok {
-                    // The following is a workaround for the `crash.test`. It gives the thread of
-                    // a crashed database connection another chance to get scheduled to release any
-                    // locks it might have. Production implementations should either live with a
-                    // chance of not getting an exclusive lock for a very short amount of time
-                    // (until the crashed connection is closed), or should ensure a proper order
-                    // of unlocking a crashed connection and locking in another connection.
-                    log::trace!("{{{}}} lock failed, sleep and retry", self.id);
-                    thread::sleep(Duration::from_millis(1));
-                    ok = self.lock(to)?;
-                }
-
-                if ok {
+                if self.lock(to)? {
                     log::debug!(
                         "{{{}}} lock {:?} granted @ {:?} ({:?})",
                         self.id,
