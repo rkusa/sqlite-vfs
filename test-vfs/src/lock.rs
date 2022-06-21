@@ -5,7 +5,7 @@ use std::os::unix::prelude::FromRawFd;
 use std::path::Path;
 use std::{env, io};
 
-use sqlite_vfs::LockKind;
+pub use sqlite_vfs::LockKind;
 
 /// SQLite's default locking on UNIX systems is quite involved to work around certain limitations
 /// of POSIX locks. See https://github.com/sqlite/sqlite/blob/master/src/os_unix.c#L1026-L1114 for

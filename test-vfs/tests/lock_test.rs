@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use test_vfs_lock::{Lock, LockKind};
+use test_vfs::lock::{Lock, LockKind};
 
 fn test_file(name: &str) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
