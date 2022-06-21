@@ -37,51 +37,10 @@ RUN cd build && make \
 RUN chown -R sqlite:sqlite /home/sqlite/build
 RUN rm -rf /home/sqlite/test-vfs
 
-# Remove unix file system specific tests from wal2 that expect the db-shm to be persisted to disk
-# and also care about file permissions for db-wal, db-shm and journal files. Since the test VFS
-# isn't meant for saving files to disk, those tests are removed.
-COPY patch/test/wal2.test.patch wal2.test.patch
-RUN patch sqlite-src-3370200/test/wal2.test wal2.test.patch && rm wal2.test.patch
-RUN rm sqlite-src-3370200/test/journal3.test
-
-# Remove e_walauto.test as it requires an actually memory mapped wal index
-RUN rm sqlite-src-3370200/test/e_walauto.test
-RUN rm sqlite-src-3370200/test/mmapwarm.test
-
-# Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
-RUN rm sqlite-src-3370200/test/external_reader.test
-
-# Remove oserror.test as it tests specifics of the default unix/windows VFS modules.
-RUN rm sqlite-src-3370200/test/oserror.test
-
-# Loading extensions is not supported
-RUN rm sqlite-src-3370200/test/loadext.test
-RUN rm sqlite-src-3370200/test/loadext2.test
-
-# Remove long running tests that while being green, don't contribute tests relevant for a VFS
-# implementation so it is not forth waiting for them.
-RUN rm sqlite-src-3370200/test/backup_ioerr.test
-RUN rm sqlite-src-3370200/test/speed1.test
-RUN rm sqlite-src-3370200/test/speed1p.test
-RUN rm sqlite-src-3370200/test/speed2.test
-RUN rm sqlite-src-3370200/test/speed3.test
-RUN rm sqlite-src-3370200/test/speed4.test
-RUN rm sqlite-src-3370200/test/speed4p.test
-
-# Remove tests from misc7 that only test file-system specific behaviour which don't contribute
-# to the test coverage of a custom VFS such as the OS running out of file descriptors and trying
-# to write a file on disk that is read-only.
-COPY patch/test/misc7.test.patch misc7.test.patch
-RUN patch sqlite-src-3370200/test/misc7.test misc7.test.patch && rm misc7.test.patch
-
-# Remove tests that expect `xSetSystemCall`, which is not implemented.
-RUN rm sqlite-src-3370200/test/mmap2.test
-RUN rm sqlite-src-3370200/test/syscall.test
-RUN rm sqlite-src-3370200/test/sysfault.test
-RUN rm sqlite-src-3370200/test/wal64k.test
-
-# Remove tests that only test a specific built-in VFS
-RUN rm sqlite-src-3370200/test/unixexcl.test
+# Patch/skip some tests
+COPY patch/test patch
+COPY patch.sh .
+RUN cd sqlite-src-3370200 && ../patch.sh && rm -rf ../{patch,patch.sh}
 
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
