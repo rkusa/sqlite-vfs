@@ -31,11 +31,6 @@ rm test/speed3.test
 rm test/speed4.test
 rm test/speed4p.test
 
-# Remove tests from misc7 that only test file-system specific behaviour which don't contribute
-# to the test coverage of a custom VFS such as the OS running out of file descriptors and trying
-# to write a file on disk that is read-only.
-patch test/misc7.test ../patch/misc7.test.patch
-
 # Remove tests that expect `xSetSystemCall`, which is not implemented.
 rm test/mmap2.test
 rm test/syscall.test
