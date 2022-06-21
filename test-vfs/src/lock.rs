@@ -17,7 +17,7 @@ pub use sqlite_vfs::LockKind;
 /// either unlocked, shared or exclusive). This is why each database lock consists out of two BSD
 /// locks. They work as follows to achieve the SQLite lock states:
 ///
-///                 {name}.db        /tmp/{ino}.lck
+/// |               {name}.db        /tmp/{ino}.lck
 ///
 /// unlocked        unlocked         unlocked
 ///
