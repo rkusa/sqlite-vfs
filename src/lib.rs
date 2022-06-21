@@ -223,7 +223,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
     as_default: bool,
 ) -> Result<(), RegisterError> {
     let io_methods = ffi::sqlite3_io_methods {
-        iVersion: 3,
+        iVersion: 2,
         xClose: Some(io::close::<V, F>),
         xRead: Some(io::read::<V, F>),
         xWrite: Some(io::write::<V, F>),
@@ -240,8 +240,8 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xShmLock: Some(io::shm_lock::<V, F>),
         xShmBarrier: Some(io::shm_barrier::<V, F>),
         xShmUnmap: Some(io::shm_unmap::<V, F>),
-        xFetch: Some(io::mem_fetch::<V, F>),
-        xUnfetch: Some(io::mem_unfetch::<V, F>),
+        xFetch: None,
+        xUnfetch: None,
     };
     let name = CString::new(name)?;
     let name_ptr = name.as_ptr();
@@ -1553,48 +1553,6 @@ mod io {
         } else {
             ffi::SQLITE_OK
         }
-    }
-
-    /// Fetch a page of a memory-mapped file.
-    pub unsafe extern "C" fn mem_fetch<V, F: DatabaseHandle>(
-        p_file: *mut ffi::sqlite3_file,
-        i_ofst: i64,
-        i_amt: i32,
-        _pp: *mut *mut c_void,
-    ) -> i32 {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
-        };
-        log::trace!(
-            "[{}] mem_fetch offset={} len={} ({})",
-            state.id,
-            i_ofst,
-            i_amt,
-            state.db_name
-        );
-
-        ffi::SQLITE_ERROR
-    }
-
-    /// Release a memory-mapped page.
-    pub unsafe extern "C" fn mem_unfetch<V, F>(
-        p_file: *mut ffi::sqlite3_file,
-        i_ofst: i64,
-        _p_page: *mut c_void,
-    ) -> i32 {
-        let state = match file_state::<V, F>(p_file) {
-            Ok(f) => f,
-            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
-        };
-        log::trace!(
-            "[{}] mem_unfetch offset={} ({})",
-            state.id,
-            i_ofst,
-            state.db_name
-        );
-
-        ffi::SQLITE_OK
     }
 }
 
