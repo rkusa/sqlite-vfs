@@ -19,20 +19,13 @@ use super::response::Response;
 pub struct Server {
     next_id: AtomicUsize,
     #[allow(clippy::type_complexity)]
-    wal_indices: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<WalIndex>>>>>,
+    wal_locks: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<HashMap<u8, WalIndexLockState>>>>>>,
 }
 
 pub struct FileConnection {
     id: usize,
-    buffer: Vec<u8>,
-    wal_index: Rc<RefCell<WalIndex>>,
+    wal_index: Rc<RefCell<HashMap<u8, WalIndexLockState>>>,
     wal_index_lock: HashMap<u8, WalIndexLock>,
-}
-
-#[derive(Default)]
-struct WalIndex {
-    data: HashMap<u32, [u8; 32768]>,
-    locks: HashMap<u8, WalIndexLockState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,16 +90,15 @@ impl Server {
                 let exists = path.is_file();
 
                 let wal_index = {
-                    let mut objects = self.wal_indices.borrow_mut();
+                    let mut objects = self.wal_locks.borrow_mut();
                     match objects.entry(path.clone()) {
                         Entry::Occupied(mut entry) => {
                             let w = entry.get();
                             if let Some(a) = w.upgrade() {
                                 // database file got deleted by test, reset its wal indices
                                 if !exists {
-                                    let mut wal_index = a.borrow_mut();
-                                    wal_index.data.clear();
-                                    wal_index.locks.clear();
+                                    let mut locks = a.borrow_mut();
+                                    locks.clear();
                                 }
                                 a
                             } else {
@@ -127,7 +119,6 @@ impl Server {
 
                 let file_conn = FileConnection {
                     id,
-                    buffer: Vec::with_capacity(4096),
                     wal_index,
                     wal_index_lock: Default::default(),
                 };
@@ -157,7 +148,7 @@ impl ServerConnection {
         }
     }
 
-    async fn send<'a>(&'a mut self, req: Response<'a>) -> io::Result<()> {
+    async fn send(&mut self, req: Response) -> io::Result<()> {
         self.inner
             .send(|data: &mut Vec<u8>| req.encode(data))
             .await?;
@@ -179,35 +170,15 @@ impl FileConnection {
         Ok(())
     }
 
-    async fn handle_request<'a, 'b>(&'a mut self, req: Request<'b>) -> io::Result<Response<'a>> {
+    async fn handle_request<'a, 'b>(&'a mut self, req: Request<'b>) -> io::Result<Response> {
         match req {
             Request::Open { .. } => Ok(Response::Denied),
-            Request::GetWalIndex { region } => {
-                let mut wal_index = self.wal_index.borrow_mut();
-                let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
-                self.buffer.resize(32768, 0);
-                (&mut self.buffer[..32768]).copy_from_slice(&data[..]);
-                Ok(Response::GetWalIndex(
-                    (&self.buffer[..32768]).try_into().unwrap(),
-                ))
-            }
-            Request::PutWalIndex { region, data } => {
-                let mut wal_index = self.wal_index.borrow_mut();
-                if let Some(previous) = wal_index.data.get(&region) {
-                    if previous == data {
-                        // log::error!("{{{}}} unnecessary index write!", self.id);
-                    }
-                }
-                wal_index.data.insert(region, *data);
-
-                Ok(Response::PutWalIndex)
-            }
             Request::LockWalIndex { locks, lock: to } => {
                 let mut wal_index = self.wal_index.borrow_mut();
 
                 // check whether all locks are available
                 for region in locks.clone() {
-                    let current = wal_index.locks.entry(region).or_default();
+                    let current = wal_index.entry(region).or_default();
                     let from = self.wal_index_lock.entry(region).or_default();
                     log::debug!(
                         "{{{}}} region={} transition {:?} from {:?} to {:?}",
@@ -225,19 +196,13 @@ impl FileConnection {
 
                 // set all locks
                 for region in locks {
-                    let current = wal_index.locks.entry(region).or_default();
+                    let current = wal_index.entry(region).or_default();
                     let from = self.wal_index_lock.entry(region).or_default();
                     *current = transition_wal_index_lock(current, *from, to).unwrap();
                     *from = to;
                 }
 
                 Ok(Response::LockWalIndex)
-            }
-            Request::DeleteWalIndex => {
-                let mut wal_index = self.wal_index.borrow_mut();
-                wal_index.data.clear();
-                wal_index.locks.clear();
-                Ok(Response::DeleteWalIndex)
             }
         }
     }

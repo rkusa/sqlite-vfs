@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use durable_object::client::Client;
-use sqlite_vfs::{LockKind, OpenAccess, OpenOptions, Vfs, WalIndex, WalIndexLock};
+use sqlite_vfs::{LockKind, OpenAccess, OpenKind, OpenOptions, Vfs, WalIndex, WalIndexLock};
 
 use crate::lock::Lock;
 
@@ -22,6 +22,7 @@ pub struct TestVfs {
 pub struct Connection {
     client: Mutex<Client>,
     path: PathBuf,
+    path_shm: PathBuf,
     file: File,
     file_ino: u64,
     lock: Option<Lock>,
@@ -39,6 +40,18 @@ impl Vfs for TestVfs {
                 return Err(ErrorKind::PermissionDenied.into());
             }
             return Err(io::Error::new(ErrorKind::Other, "cannot open directory"));
+        }
+
+        let path_shm = path.with_extension(format!(
+            "{}-shm",
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("db")
+        ));
+        if opts.kind == OpenKind::MainDb && !path.is_file() {
+            // If the database file was deleted externally, make sure that there is no old .db-shm
+            // lying around.
+            fs::remove_file(&path_shm).ok();
         }
 
         let client = Mutex::new(Client::connect("/tmp/test-vfs-sock", db)?);
@@ -59,6 +72,7 @@ impl Vfs for TestVfs {
 
         Ok(Connection {
             client,
+            path_shm,
             path,
             file,
             file_ino,
@@ -173,8 +187,9 @@ impl sqlite_vfs::DatabaseHandle for Connection {
 
 impl WalIndex<Connection> for WalConnection {
     fn map(handle: &mut Connection, region: u32) -> Result<[u8; 32768], std::io::Error> {
-        let mut client = handle.client.lock().unwrap();
-        client.get_wal_index(region)
+        let mut data = [0u8; 32768];
+        Self::pull(handle, region, &mut data)?;
+        Ok(data)
     }
 
     fn lock(
@@ -194,11 +209,10 @@ impl WalIndex<Connection> for WalConnection {
     }
 
     fn delete(handle: &mut Connection) -> Result<(), std::io::Error> {
-        let mut client = handle.client.lock().unwrap();
-        client.delete_wal_index()?;
+        fs::remove_file(&handle.path_shm)?;
 
-        let shm_path = Self::shm_path(handle);
-        fs::remove_file(shm_path).ok();
+        // let mut client = handle.client.lock().unwrap();
+        // client.lock_wal_index(0..6, durable_object::request::WalIndexLock::None)?;
 
         Ok(())
     }
@@ -208,16 +222,22 @@ impl WalIndex<Connection> for WalConnection {
         region: u32,
         data: &mut [u8; 32768],
     ) -> Result<(), std::io::Error> {
-        // Some tests rely on the existence of the `.db-shm` file, thus make sure it exists,
-        // even though it isn't actually used for anything.
-        let shm_path = Self::shm_path(handle);
-        if !shm_path.is_file() {
-            fs::write(shm_path, "")?;
+        let mut shm = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&handle.path_shm)?;
+
+        let current_size = shm.metadata()?.size();
+        let min_size = (region as u64 + 1) * 32768;
+        if current_size < min_size {
+            shm.set_len(min_size)?;
         }
 
-        let mut client = handle.client.lock().unwrap();
-        let new_data = client.get_wal_index(region)?;
-        data.copy_from_slice(&new_data[..]);
+        shm.seek(SeekFrom::Start(region as u64 * 32768))?;
+        shm.read_exact(data)?;
+
         Ok(())
     }
 
@@ -226,34 +246,25 @@ impl WalIndex<Connection> for WalConnection {
         region: u32,
         data: &[u8; 32768],
     ) -> Result<(), std::io::Error> {
-        let mut client = handle.client.lock().unwrap();
-        client.put_wal_index(region, data)?;
-
-        // Some tests rely on the size of the `.db-shm` file, thus make sure it grows
-        let shm_path = Self::shm_path(handle);
-        let shm = fs::OpenOptions::new()
+        let mut shm = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&shm_path)?;
-        let size = region as u64 * 32768;
-        if shm.metadata()?.size() < size {
-            shm.set_len(size as u64)?;
+            .create(true)
+            .truncate(false)
+            .open(&handle.path_shm)?;
+
+        let current_size = shm.metadata()?.size();
+        let min_size = (region as u64 + 1) * 32768;
+        if current_size < min_size {
+            shm.set_len(min_size)?;
         }
 
-        Ok(())
-    }
-}
+        shm.seek(SeekFrom::Start(region as u64 * 32768))?;
+        shm.write_all(data)?;
+        // shm.flush()?;
+        shm.sync_all()?;
 
-impl WalConnection {
-    fn shm_path(handle: &Connection) -> PathBuf {
-        handle.path.with_extension(format!(
-            "{}-shm",
-            handle
-                .path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("db")
-        ))
+        Ok(())
     }
 }
 

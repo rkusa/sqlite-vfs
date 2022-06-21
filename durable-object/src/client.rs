@@ -28,28 +28,6 @@ impl Client {
         }
     }
 
-    pub fn get_wal_index(&mut self, region: u32) -> io::Result<[u8; 32768]> {
-        let res = self.send(Request::GetWalIndex { region })?;
-        match res {
-            Response::GetWalIndex(data) => Ok(*data),
-            _ => Err(io::Error::new(
-                ErrorKind::Other,
-                "received unexpected response",
-            )),
-        }
-    }
-
-    pub fn put_wal_index(&mut self, region: u32, data: &[u8; 32768]) -> io::Result<()> {
-        let res = self.send(Request::PutWalIndex { region, data })?;
-        match res {
-            Response::PutWalIndex => Ok(()),
-            _ => Err(io::Error::new(
-                ErrorKind::Other,
-                "received unexpected response",
-            )),
-        }
-    }
-
     pub fn lock_wal_index(&mut self, locks: Range<u8>, lock: WalIndexLock) -> io::Result<bool> {
         let res = self.send(Request::LockWalIndex { locks, lock })?;
         match res {
@@ -59,18 +37,6 @@ impl Client {
                 ErrorKind::Other,
                 "received unexpected response",
             )),
-        }
-    }
-
-    pub fn delete_wal_index(&mut self) -> io::Result<()> {
-        let res = self.send(Request::DeleteWalIndex)?;
-        if let Response::DeleteWalIndex = res {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                ErrorKind::Other,
-                "received unexpected response",
-            ))
         }
     }
 
