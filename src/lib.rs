@@ -198,7 +198,7 @@ pub enum LockKind {
     Exclusive,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum WalIndexLock {
     None = 1,

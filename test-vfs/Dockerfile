@@ -86,12 +86,6 @@ RUN rm sqlite-src-3370200/test/unixexcl.test
 RUN mkdir /home/sqlite/lib/
 ENV LD_LIBRARY_PATH /home/sqlite/lib/
 
-# Increase limit of concurrently open files, because the test-vfs locking mechanism needs an
-# additional file per database and each database handle has an open TCP connection to the wal index
-# server.
-# Remove once TCP server got removed. Retest: manydb
-RUN echo "sqlite  soft  nofile  2048" >> /etc/security/limits.conf
-
 WORKDIR /github/workspace
 COPY entrypoint.sh /
 ENTRYPOINT ["/entrypoint.sh"]

@@ -186,7 +186,7 @@ impl Lock {
     }
 }
 
-fn flock_unlock(fd: RawFd) {
+pub(crate) fn flock_unlock(fd: RawFd) {
     unsafe {
         if libc::flock(fd, libc::LOCK_UN | libc::LOCK_NB) != 0 {
             panic!("unlock failed: {}", std::io::Error::last_os_error());
@@ -194,7 +194,7 @@ fn flock_unlock(fd: RawFd) {
     }
 }
 
-fn flock_shared(fd: RawFd) -> bool {
+pub(crate) fn flock_shared(fd: RawFd) -> bool {
     unsafe {
         if libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) == 0 {
             return true;
@@ -209,7 +209,7 @@ fn flock_shared(fd: RawFd) -> bool {
     panic!("lock shared failed: {}", err);
 }
 
-fn flock_exclusive(fd: RawFd) -> bool {
+pub(crate) fn flock_exclusive(fd: RawFd) -> bool {
     unsafe {
         if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 {
             return true;

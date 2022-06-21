@@ -10,10 +10,7 @@ documentation = "https://docs.rs/sqlite-vfs"
 keywords = ["sqlite", "vfs"]
 
 [workspace]
-members = [
-  "durable-object",
-  "test-vfs",
-]
+members = ["test-vfs"]
 
 [dependencies]
 log = "0.4"

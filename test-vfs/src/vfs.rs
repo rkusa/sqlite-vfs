@@ -4,12 +4,11 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::prelude::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-use durable_object::client::Client;
 use sqlite_vfs::{LockKind, OpenAccess, OpenKind, OpenOptions, Vfs, WalIndex, WalIndexLock};
 
 use crate::lock::Lock;
+use crate::range_lock::RangeLock;
 
 /// [Vfs] test implementation based on Rust's [std::fs:File]. This implementation is not meant for
 /// any use-cases except running SQLite unit tests, as the locking is only managed in process
@@ -20,12 +19,12 @@ pub struct TestVfs {
 }
 
 pub struct Connection {
-    client: Mutex<Client>,
     path: PathBuf,
     path_shm: PathBuf,
     file: File,
     file_ino: u64,
     lock: Option<Lock>,
+    wal_lock: RangeLock,
 }
 
 pub struct WalConnection;
@@ -54,8 +53,6 @@ impl Vfs for TestVfs {
             fs::remove_file(&path_shm).ok();
         }
 
-        let client = Mutex::new(Client::connect("/tmp/test-vfs-sock", db)?);
-
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
         match opts.access {
@@ -71,13 +68,13 @@ impl Vfs for TestVfs {
         let file_ino = file.metadata()?.ino();
 
         Ok(Connection {
-            client,
             path_shm,
             path,
             file,
             file_ino,
             // Will be set on first use to reduce unnecessary usage of file descriptors.
             lock: None,
+            wal_lock: RangeLock::new(file_ino),
         })
     }
 
@@ -197,24 +194,11 @@ impl WalIndex<Connection> for WalConnection {
         locks: std::ops::Range<u8>,
         lock: WalIndexLock,
     ) -> Result<bool, std::io::Error> {
-        let mut client = handle.client.lock().unwrap();
-        client.lock_wal_index(
-            locks,
-            match lock {
-                WalIndexLock::None => durable_object::request::WalIndexLock::None,
-                WalIndexLock::Shared => durable_object::request::WalIndexLock::Shared,
-                WalIndexLock::Exclusive => durable_object::request::WalIndexLock::Exclusive,
-            },
-        )
+        handle.wal_lock.lock(locks, lock)
     }
 
     fn delete(handle: &mut Connection) -> Result<(), std::io::Error> {
-        fs::remove_file(&handle.path_shm)?;
-
-        // let mut client = handle.client.lock().unwrap();
-        // client.lock_wal_index(0..6, durable_object::request::WalIndexLock::None)?;
-
-        Ok(())
+        fs::remove_file(&handle.path_shm)
     }
 
     fn pull(

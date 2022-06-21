@@ -1,9 +1,0 @@
-[package]
-name = "durable-object"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-log = "0.4"
-pretty_env_logger = "0.4"
-tokio = { version = "1.19", features = ["macros", "net", "rt", "io-util"] }
