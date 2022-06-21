@@ -31,12 +31,6 @@ rm test/speed3.test
 rm test/speed4.test
 rm test/speed4p.test
 
-# Remove tests that expect `xSetSystemCall`, which is not implemented.
-rm test/mmap2.test
-rm test/syscall.test
-rm test/sysfault.test
-rm test/wal64k.test
-
 # Remove tests that only test a specific built-in VFS
 rm test/unixexcl.test
 

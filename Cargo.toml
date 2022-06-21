@@ -22,3 +22,6 @@ default = []
 
 # Only enable when building with the included `./test-vfs`.
 sqlite_test = []
+
+# Enable an delegate to parent VFS: `xSetSystemCall`, `xGetSystemCall` and `xNextSystemCall`
+syscall = []

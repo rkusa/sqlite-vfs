@@ -209,6 +209,8 @@ pub enum WalIndexLock {
 struct State<V> {
     name: CString,
     vfs: Arc<V>,
+    #[cfg(any(feature = "syscall", feature = "mmio"))]
+    parent_vfs: *mut ffi::sqlite3_vfs,
     io_methods: ffi::sqlite3_io_methods,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
     next_id: usize,
@@ -246,12 +248,17 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
     let ptr = Box::into_raw(Box::new(State {
         name,
         vfs: Arc::new(vfs),
+        #[cfg(any(feature = "syscall"))]
+        parent_vfs: unsafe { ffi::sqlite3_vfs_find(std::ptr::null_mut()) },
         io_methods,
         last_error: Default::default(),
         next_id: 0,
     }));
     let vfs = Box::into_raw(Box::new(ffi::sqlite3_vfs {
+        #[cfg(not(feature = "syscall"))]
         iVersion: 2,
+        #[cfg(feature = "syscall")]
+        iVersion: 3,
         szOsFile: size_of::<FileState<V, F>>() as i32,
         mxPathname: MAX_PATH_LENGTH as i32, // max path length supported by VFS
         pNext: null_mut(),
@@ -270,9 +277,20 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xCurrentTime: Some(vfs::current_time::<V>),
         xGetLastError: Some(vfs::get_last_error::<V>),
         xCurrentTimeInt64: Some(vfs::current_time_int64::<V>),
+
+        #[cfg(not(feature = "syscall"))]
         xSetSystemCall: None,
+        #[cfg(not(feature = "syscall"))]
         xGetSystemCall: None,
+        #[cfg(not(feature = "syscall"))]
         xNextSystemCall: None,
+
+        #[cfg(feature = "syscall")]
+        xSetSystemCall: Some(vfs::set_system_call::<V>),
+        #[cfg(feature = "syscall")]
+        xGetSystemCall: Some(vfs::get_system_call::<V>),
+        #[cfg(feature = "syscall")]
+        xNextSystemCall: Some(vfs::next_system_call::<V>),
     }));
 
     let result = unsafe { ffi::sqlite3_vfs_register(vfs, as_default as i32) };
@@ -653,6 +671,58 @@ mod vfs {
 
         *p = now;
         ffi::SQLITE_OK
+    }
+
+    #[cfg(feature = "syscall")]
+    pub unsafe extern "C" fn set_system_call<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+        p_new_func: ffi::sqlite3_syscall_ptr,
+    ) -> ::std::os::raw::c_int {
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+
+        if let Some(set_system_call) = state.parent_vfs.as_ref().and_then(|v| v.xSetSystemCall) {
+            return set_system_call(state.parent_vfs, z_name, p_new_func);
+        }
+
+        ffi::SQLITE_ERROR
+    }
+
+    #[cfg(feature = "syscall")]
+    pub unsafe extern "C" fn get_system_call<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+    ) -> ffi::sqlite3_syscall_ptr {
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return None,
+        };
+
+        if let Some(get_system_call) = state.parent_vfs.as_ref().and_then(|v| v.xGetSystemCall) {
+            return get_system_call(state.parent_vfs, z_name);
+        }
+
+        None
+    }
+
+    #[cfg(feature = "syscall")]
+    pub unsafe extern "C" fn next_system_call<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_name: *const ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char {
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return std::ptr::null(),
+        };
+
+        if let Some(next_system_call) = state.parent_vfs.as_ref().and_then(|v| v.xNextSystemCall) {
+            return next_system_call(state.parent_vfs, z_name);
+        }
+
+        std::ptr::null()
     }
 
     pub unsafe extern "C" fn get_last_error<V>(
