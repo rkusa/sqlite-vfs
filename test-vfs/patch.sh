@@ -17,7 +17,8 @@ rm test/external_reader.test
 # Remove oserror.test as it tests specifics of the default unix/windows VFS modules.
 rm test/oserror.test
 
-# Loading extensions is not supported
+# Well, I couldn't figure out how to build the needed `libtestloadext.so`, so they are skipped for
+# now.
 rm test/loadext.test
 rm test/loadext2.test
 

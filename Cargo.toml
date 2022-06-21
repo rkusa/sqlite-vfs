@@ -25,3 +25,6 @@ sqlite_test = []
 
 # Enable an delegate to parent VFS: `xSetSystemCall`, `xGetSystemCall` and `xNextSystemCall`
 syscall = []
+
+# Enable an delegate to parent VFS: `xDlOpen`, `xDlError`, `xDlSym` and `xDlClose`
+loadext = []

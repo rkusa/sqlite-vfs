@@ -209,7 +209,7 @@ pub enum WalIndexLock {
 struct State<V> {
     name: CString,
     vfs: Arc<V>,
-    #[cfg(any(feature = "syscall", feature = "mmio"))]
+    #[cfg(any(feature = "syscall", feature = "loadext"))]
     parent_vfs: *mut ffi::sqlite3_vfs,
     io_methods: ffi::sqlite3_io_methods,
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
@@ -248,7 +248,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
     let ptr = Box::into_raw(Box::new(State {
         name,
         vfs: Arc::new(vfs),
-        #[cfg(any(feature = "syscall"))]
+        #[cfg(any(feature = "syscall", feature = "loadext"))]
         parent_vfs: unsafe { ffi::sqlite3_vfs_find(std::ptr::null_mut()) },
         io_methods,
         last_error: Default::default(),
@@ -268,10 +268,10 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xDelete: Some(vfs::delete::<V>),
         xAccess: Some(vfs::access::<V>),
         xFullPathname: Some(vfs::full_pathname::<V>),
-        xDlOpen: Some(vfs::dlopen),
-        xDlError: Some(vfs::dlerror),
-        xDlSym: Some(vfs::dlsym),
-        xDlClose: Some(vfs::dlclose),
+        xDlOpen: Some(vfs::dlopen::<V>),
+        xDlError: Some(vfs::dlerror::<V>),
+        xDlSym: Some(vfs::dlsym::<V>),
+        xDlClose: Some(vfs::dlclose::<V>),
         xRandomness: Some(vfs::randomness),
         xSleep: Some(vfs::sleep),
         xCurrentTime: Some(vfs::current_time::<V>),
@@ -568,42 +568,99 @@ mod vfs {
     }
 
     /// Open the dynamic library located at `z_path` and return a handle.
-    pub unsafe extern "C" fn dlopen(
-        _p_vfs: *mut ffi::sqlite3_vfs,
-        _z_path: *const c_char,
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dlopen<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        z_path: *const c_char,
     ) -> *mut c_void {
         log::trace!("dlopen");
+
+        #[cfg(feature = "loadext")]
+        {
+            let state = match vfs_state::<V>(p_vfs) {
+                Ok(state) => state,
+                Err(_) => return null_mut(),
+            };
+
+            if let Some(dlopen) = state.parent_vfs.as_ref().and_then(|v| v.xDlOpen) {
+                return dlopen(state.parent_vfs, z_path);
+            }
+        }
 
         null_mut()
     }
 
     /// Populate the buffer `z_err_msg` (size `n_byte` bytes) with a human readable utf-8 string
     /// describing the most recent error encountered associated with dynamic libraries.
-    pub unsafe extern "C" fn dlerror(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dlerror<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
         z_err_msg: *mut c_char,
     ) {
         log::trace!("dlerror");
 
-        let msg = concat!("Loadable extensions are not supported", "\0");
-        ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr() as _);
+        #[cfg(feature = "loadext")]
+        {
+            let state = match vfs_state::<V>(p_vfs) {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+
+            if let Some(dlerror) = state.parent_vfs.as_ref().and_then(|v| v.xDlError) {
+                return dlerror(state.parent_vfs, n_byte, z_err_msg);
+            }
+
+            return;
+        }
+
+        #[cfg(not(feature = "loadext"))]
+        {
+            let msg = concat!("Loadable extensions are not supported", "\0");
+            ffi::sqlite3_snprintf(n_byte, z_err_msg, msg.as_ptr() as _);
+        }
     }
 
     /// Return a pointer to the symbol `z_sym` in the dynamic library pHandle.
-    pub unsafe extern "C" fn dlsym(
-        _p_vfs: *mut ffi::sqlite3_vfs,
-        _p: *mut c_void,
-        _z_sym: *const c_char,
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dlsym<V>(
+        p_vfs: *mut ffi::sqlite3_vfs,
+        p: *mut c_void,
+        z_sym: *const c_char,
     ) -> Option<unsafe extern "C" fn(*mut ffi::sqlite3_vfs, *mut c_void, *const c_char)> {
         log::trace!("dlsym");
+
+        #[cfg(feature = "loadext")]
+        {
+            let state = match vfs_state::<V>(p_vfs) {
+                Ok(state) => state,
+                Err(_) => return None,
+            };
+
+            if let Some(dlsym) = state.parent_vfs.as_ref().and_then(|v| v.xDlSym) {
+                return dlsym(state.parent_vfs, p, z_sym);
+            }
+        }
 
         None
     }
 
     /// Close the dynamic library handle `p_handle`.
-    pub unsafe extern "C" fn dlclose(_p_vfs: *mut ffi::sqlite3_vfs, _p_handle: *mut c_void) {
+    #[allow(unused_variables)]
+    pub unsafe extern "C" fn dlclose<V>(p_vfs: *mut ffi::sqlite3_vfs, p_handle: *mut c_void) {
         log::trace!("dlclose");
+
+        #[cfg(feature = "loadext")]
+        {
+            let state = match vfs_state::<V>(p_vfs) {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+
+            if let Some(dlclose) = state.parent_vfs.as_ref().and_then(|v| v.xDlClose) {
+                return dlclose(state.parent_vfs, p_handle);
+            }
+        }
     }
 
     /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
