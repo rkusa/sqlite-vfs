@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use durable_object::client::Client;
-use sqlite_vfs::{Lock, OpenAccess, OpenOptions, Vfs, WalIndex, WalIndexLock};
+use sqlite_vfs::{LockKind, OpenAccess, OpenOptions, Vfs, WalIndex, WalIndexLock};
+
+use crate::lock::Lock;
 
 /// [Vfs] test implementation based on Rust's [std::fs:File]. This implementation is not meant for
 /// any use-cases except running SQLite unit tests, as the locking is only managed in process
@@ -19,10 +21,10 @@ pub struct TestVfs {
 
 pub struct Connection {
     client: Mutex<Client>,
-    lock: Lock,
     path: PathBuf,
     file: File,
     file_ino: u64,
+    lock: Option<Lock>,
 }
 
 pub struct WalConnection;
@@ -57,10 +59,11 @@ impl Vfs for TestVfs {
 
         Ok(Connection {
             client,
-            lock: Lock::default(),
             path,
             file,
             file_ino,
+            // Will be set on first use to reduce unnecessary usage of file descriptors.
+            lock: None,
         })
     }
 
@@ -135,48 +138,31 @@ impl sqlite_vfs::DatabaseHandle for Connection {
         self.file.set_len(len)
     }
 
-    fn lock(&mut self, to: sqlite_vfs::Lock) -> Result<bool, std::io::Error> {
-        // eprintln!("lock {}:", self.path.to_string_lossy());
-        // eprintln!("    {:?}: {:?} -> {:?}", state, self.lock, to);
+    fn lock(&mut self, to: LockKind) -> Result<bool, std::io::Error> {
+        let lock = match &mut self.lock {
+            Some(lock) => lock,
+            None => self.lock.get_or_insert(Lock::from_file(&self.file)?),
+        };
 
-        // If there is already a lock of the requested type, do nothing.
-        if self.lock == to {
-            return Ok(true);
-        }
-
-        let mut client = self.client.lock().unwrap();
-        let lock = client.lock(match to {
-            Lock::None => durable_object::request::Lock::None,
-            Lock::Shared => durable_object::request::Lock::Shared,
-            Lock::Reserved => durable_object::request::Lock::Reserved,
-            Lock::Pending => durable_object::request::Lock::Pending,
-            Lock::Exclusive => durable_object::request::Lock::Exclusive,
-        })?;
-        if let Some(lock) = lock {
-            self.lock = match lock {
-                durable_object::request::Lock::None => Lock::None,
-                durable_object::request::Lock::Shared => Lock::Shared,
-                durable_object::request::Lock::Reserved => Lock::Reserved,
-                durable_object::request::Lock::Pending => Lock::Pending,
-                durable_object::request::Lock::Exclusive => Lock::Exclusive,
-            };
-            Ok(self.lock == to)
-        } else {
-            Ok(false)
-        }
+        // Return false if exclusive was requested and only pending was acquired.
+        Ok(lock.lock(to) && lock.current() == to)
     }
 
-    fn reserved(&self) -> Result<bool, std::io::Error> {
-        if self.lock > Lock::Shared {
-            return Ok(true);
-        }
+    fn reserved(&mut self) -> Result<bool, std::io::Error> {
+        let lock = match &mut self.lock {
+            Some(lock) => lock,
+            None => self.lock.get_or_insert(Lock::from_file(&self.file)?),
+        };
 
-        let mut client = self.client.lock().unwrap();
-        client.reserved()
+        Ok(lock.reserved())
     }
 
-    fn current_lock(&self) -> Result<Lock, std::io::Error> {
-        Ok(self.lock)
+    fn current_lock(&self) -> Result<LockKind, std::io::Error> {
+        Ok(self
+            .lock
+            .as_ref()
+            .map(|l| l.current())
+            .unwrap_or(LockKind::None))
     }
 
     fn moved(&self) -> Result<bool, std::io::Error> {

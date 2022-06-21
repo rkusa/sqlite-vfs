@@ -17,5 +17,5 @@ su -c "/github/workspace/target/debug/server" sqlite &
 sleep 1 # give server time to start up
 cd ..
 
-su -c "./testfixture ../sqlite-src-3370200/$1 --verbose=file --output=test-out.txt" \
+su -c "time ./testfixture ../sqlite-src-3370200/$1 --verbose=file --output=test-out.txt" \
   sqlite

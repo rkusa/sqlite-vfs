@@ -12,40 +12,21 @@ use tokio::task;
 use crate::connection::asynchronous::Connection;
 use crate::request::WalIndexLock;
 
-use super::request::{Lock, Request};
+use super::request::Request;
 use super::response::Response;
 
 #[derive(Default)]
 pub struct Server {
     next_id: AtomicUsize,
     #[allow(clippy::type_complexity)]
-    file_locks: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<FileLockState>>>>>,
-    #[allow(clippy::type_complexity)]
     wal_indices: Rc<RefCell<HashMap<PathBuf, Weak<RefCell<WalIndex>>>>>,
 }
 
 pub struct FileConnection {
     id: usize,
-    path: PathBuf,
-    file_lock: Rc<RefCell<FileLockState>>,
-    conn_lock: Lock,
     buffer: Vec<u8>,
     wal_index: Rc<RefCell<WalIndex>>,
     wal_index_lock: HashMap<u8, WalIndexLock>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FileLockState {
-    /// The object is shared for reading between `count` locks.
-    Read { count: usize },
-    /// The object has [Lock::Reserved] lock, so new and existing read locks are still allowed, just
-    /// not another [Lock::Reserved] (or write) lock.
-    Reserved { count: usize },
-    /// The object has a [Lock::Pending] lock, so new read locks are not allowed, and it is awaiting
-    /// for the read `count` to get to zero.
-    Pending { count: usize },
-    /// The object has an [Lock::Exclusive] lock.
-    Exclusive,
 }
 
 #[derive(Default)]
@@ -115,27 +96,6 @@ impl Server {
                 // states.
                 let exists = path.is_file();
 
-                let file_lock = {
-                    let mut objects = self.file_locks.borrow_mut();
-                    match objects.entry(path.clone()) {
-                        Entry::Occupied(mut entry) => {
-                            // database file got deleted by test, reset its lock states
-                            let w = entry.get();
-                            if let Some(a) = exists.then(|| w.upgrade()).flatten() {
-                                a
-                            } else {
-                                let a: Rc<_> = Default::default();
-                                entry.insert(Rc::downgrade(&a));
-                                a
-                            }
-                        }
-                        Entry::Vacant(entry) => {
-                            let a: Rc<_> = Default::default();
-                            entry.insert(Rc::downgrade(&a));
-                            a
-                        }
-                    }
-                };
                 let wal_index = {
                     let mut objects = self.wal_indices.borrow_mut();
                     match objects.entry(path.clone()) {
@@ -167,9 +127,6 @@ impl Server {
 
                 let file_conn = FileConnection {
                     id,
-                    path,
-                    file_lock,
-                    conn_lock: Lock::None,
                     buffer: Vec::with_capacity(4096),
                     wal_index,
                     wal_index_lock: Default::default(),
@@ -225,38 +182,6 @@ impl FileConnection {
     async fn handle_request<'a, 'b>(&'a mut self, req: Request<'b>) -> io::Result<Response<'a>> {
         match req {
             Request::Open { .. } => Ok(Response::Denied),
-            Request::Lock { lock: to } => {
-                log::debug!(
-                    "{{{}}} request lock {:?} -> {:?} @ {:?} ({:?})",
-                    self.id,
-                    self.conn_lock,
-                    to,
-                    self.file_lock.borrow(),
-                    self.path,
-                );
-                if self.lock(to)? {
-                    log::debug!(
-                        "{{{}}} lock {:?} granted @ {:?} ({:?})",
-                        self.id,
-                        self.conn_lock,
-                        self.file_lock.borrow(),
-                        self.path
-                    );
-                    Ok(Response::Lock(self.conn_lock))
-                } else {
-                    log::debug!("{{{}}} lock {:?} denied ({:?})", self.id, to, self.path);
-                    Ok(Response::Denied)
-                }
-            }
-            Request::Reserved => {
-                let file_lock = self.file_lock.borrow();
-                Ok(Response::Reserved(matches!(
-                    &*file_lock,
-                    FileLockState::Pending { .. }
-                        | FileLockState::Reserved { .. }
-                        | FileLockState::Exclusive
-                )))
-            }
             Request::GetWalIndex { region } => {
                 let mut wal_index = self.wal_index.borrow_mut();
                 let data = wal_index.data.entry(region).or_insert_with(|| [0; 32768]);
@@ -316,120 +241,6 @@ impl FileConnection {
             }
         }
     }
-
-    fn lock(&mut self, to: Lock) -> io::Result<bool> {
-        let mut file_lock = self.file_lock.borrow_mut();
-        match (*file_lock, self.conn_lock, to) {
-            // Increment reader count when adding new shared lock.
-            (
-                FileLockState::Read { .. } | FileLockState::Reserved { .. },
-                Lock::None,
-                Lock::Shared,
-            ) => {
-                file_lock.increment();
-                self.conn_lock = to;
-                Ok(true)
-            }
-
-            // Don't allow new shared locks when there is a pending or exclusive lock.
-            (
-                FileLockState::Pending { .. } | FileLockState::Exclusive,
-                Lock::None,
-                Lock::Shared,
-            ) => Ok(false),
-
-            // Decrement reader count when removing shared lock.
-            (
-                FileLockState::Read { .. }
-                | FileLockState::Reserved { .. }
-                | FileLockState::Pending { .. },
-                Lock::Shared,
-                Lock::None,
-            ) => {
-                file_lock.decrement();
-                self.conn_lock = to;
-                Ok(true)
-            }
-
-            // Issue a reserved lock.
-            (FileLockState::Read { count }, Lock::Shared, Lock::Reserved) => {
-                *file_lock = FileLockState::Reserved { count: count - 1 };
-                self.conn_lock = to;
-                Ok(true)
-            }
-
-            // Return from reserved or pending to shared lock.
-            (FileLockState::Reserved { count }, Lock::Reserved, Lock::Shared)
-            | (FileLockState::Pending { count }, Lock::Pending, Lock::Shared) => {
-                *file_lock = FileLockState::Read { count: count + 1 };
-                self.conn_lock = to;
-                Ok(true)
-            }
-
-            // Return from reserved or pending to none lock.
-            (FileLockState::Reserved { count }, Lock::Reserved, Lock::None)
-            | (FileLockState::Pending { count }, Lock::Pending, Lock::None) => {
-                *file_lock = FileLockState::Read { count };
-                self.conn_lock = to;
-                Ok(true)
-            }
-
-            // Only a single write lock allowed.
-            (
-                FileLockState::Reserved { .. }
-                | FileLockState::Pending { .. }
-                | FileLockState::Exclusive,
-                Lock::Shared,
-                Lock::Reserved | Lock::Exclusive,
-            ) => Ok(false),
-
-            // Acquire an exclusive lock.
-            (FileLockState::Read { count }, Lock::Shared, Lock::Exclusive)
-            | (FileLockState::Reserved { count }, Lock::Reserved, Lock::Exclusive)
-            | (FileLockState::Pending { count }, Lock::Pending, Lock::Exclusive) => {
-                if matches!(&*file_lock, FileLockState::Read { count: 1 }) || count == 0 {
-                    *file_lock = FileLockState::Exclusive;
-                    self.conn_lock = Lock::Exclusive;
-                    Ok(true)
-                } else {
-                    *file_lock = FileLockState::Pending {
-                        count: if matches!(&*file_lock, FileLockState::Read { .. }) {
-                            count - 1 // remove itself
-                        } else {
-                            count
-                        },
-                    };
-                    self.conn_lock = Lock::Pending;
-                    Ok(true)
-                }
-            }
-
-            // Stop writing.
-            (FileLockState::Exclusive, Lock::Exclusive, Lock::Shared) => {
-                *file_lock = FileLockState::Read { count: 1 };
-                self.conn_lock = to;
-                Ok(true)
-            }
-            (FileLockState::Exclusive, Lock::Exclusive, Lock::None) => {
-                *file_lock = FileLockState::Read { count: 0 };
-                self.conn_lock = to;
-                Ok(true)
-            }
-            _ => {
-                // panic!(
-                //     "invalid lock transition ({:?}: {:?} to {:?})",
-                //     state, self.conn_lock, to
-                // );
-                Err(io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "invalid lock transition ({:?}: {:?} to {:?})",
-                        file_lock, self.conn_lock, to
-                    ),
-                ))
-            }
-        }
-    }
 }
 
 fn transition_wal_index_lock(
@@ -482,83 +293,6 @@ fn transition_wal_index_lock(
         | (WalIndexLockState::Exclusive, WalIndexLock::None, WalIndexLock::Exclusive)
         | (WalIndexLockState::Exclusive, WalIndexLock::Shared, WalIndexLock::None)
         | (WalIndexLockState::Exclusive, WalIndexLock::Shared, WalIndexLock::Exclusive) => None,
-    }
-}
-
-impl FileLockState {
-    fn increment(&mut self) {
-        *self = match *self {
-            FileLockState::Read { count } => FileLockState::Read { count: count + 1 },
-            FileLockState::Reserved { count } => FileLockState::Reserved { count: count + 1 },
-            FileLockState::Pending { count } => FileLockState::Pending { count: count + 1 },
-            FileLockState::Exclusive => FileLockState::Exclusive,
-        };
-    }
-
-    fn decrement(&mut self) {
-        *self = match *self {
-            FileLockState::Read { count } => FileLockState::Read { count: count - 1 },
-            FileLockState::Reserved { count } => FileLockState::Reserved { count: count - 1 },
-            FileLockState::Pending { count } => FileLockState::Pending { count: count - 1 },
-            FileLockState::Exclusive => FileLockState::Exclusive,
-        };
-    }
-}
-
-impl Default for FileLockState {
-    fn default() -> Self {
-        Self::Read { count: 0 }
-    }
-}
-
-impl Drop for FileConnection {
-    fn drop(&mut self) {
-        if self.conn_lock != Lock::None {
-            log::trace!(
-                "{{{}}} unlocking on connection close from {:?}",
-                self.id,
-                self.conn_lock
-            );
-
-            // make sure lock is removed once connection got closed
-            match self.lock(Lock::None) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::error!("{{{}}} unlock rejected on connection close", self.id)
-                }
-                Err(err) => log::error!(
-                    "{{{}}} failed to unlock on connection close: {}",
-                    self.id,
-                    err
-                ),
-            }
-        }
-
-        // let has_lock = self
-        //     .wal_index_lock
-        //     .iter()
-        //     .any(|(_, lock)| *lock != WalIndexLock::None);
-        // if has_lock {
-        //     log::error!("{{{}}} UNLOCKING ON DROP", self.id);
-        //     let (start, end) = {
-        //         let wal_index = self.wal_index.lock().unwrap();
-        //         let start = wal_index.locks.keys().min().cloned();
-        //         let end = wal_index.locks.keys().max().cloned();
-        //         (start, end)
-        //     };
-        //     if let Some((start, end)) = start.zip(end) {
-        //         if let Err(err) = self.handle_request(Request::LockWalIndex {
-        //             locks: start..end.saturating_add(1),
-        //             lock: WalIndexLock::None,
-        //         }) {
-        //             log::error!(
-        //                 "{{{}}} failed to unlock wal index on connection close: {}",
-        //                 self.id,
-        //                 err
-        //             );
-        //         }
-        //     }
-        // }
     }
 }
 

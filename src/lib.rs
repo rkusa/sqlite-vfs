@@ -20,7 +20,7 @@ use std::time::Instant;
 mod ffi;
 
 /// A file opened by [Vfs].
-pub trait DatabaseHandle
+pub trait DatabaseHandle: Sync
 where
     Self: Sized,
 {
@@ -48,19 +48,19 @@ where
     /// - The lock is nevered moved from [Lock::None] to anything higher than [Lock::Shared].
     /// - A [Lock::Pending] is never requested explicitly.
     /// - A [Lock::Shared] is always held when a [Lock::Reserved] lock is requested
-    fn lock(&mut self, lock: Lock) -> Result<bool, std::io::Error>;
+    fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error>;
 
     /// Unlock the database.
-    fn unlock(&mut self, lock: Lock) -> Result<bool, std::io::Error> {
+    fn unlock(&mut self, lock: LockKind) -> Result<bool, std::io::Error> {
         self.lock(lock)
     }
 
     /// Check if the database this handle points to holds a [Lock::Reserved], [Lock::Pending] or
     /// [Lock::Exclusive] lock.
-    fn reserved(&self) -> Result<bool, std::io::Error>;
+    fn reserved(&mut self) -> Result<bool, std::io::Error>;
 
     /// Return the current [Lock] of the this handle.
-    fn current_lock(&self) -> Result<Lock, std::io::Error>;
+    fn current_lock(&self) -> Result<LockKind, std::io::Error>;
 
     /// Change the chunk size of the database to `chunk_size`.
     fn set_chunk_size(&self, _chunk_size: usize) -> Result<(), std::io::Error> {
@@ -75,7 +75,7 @@ where
 }
 
 /// A virtual file system for SQLite.
-pub trait Vfs {
+pub trait Vfs: Sync {
     /// The file returned by [Vfs::open].
     type Handle: DatabaseHandle;
 
@@ -102,7 +102,7 @@ pub trait Vfs {
     }
 }
 
-pub trait WalIndex<T> {
+pub trait WalIndex<T>: Sync {
     fn enabled() -> bool {
         true
     }
@@ -162,8 +162,8 @@ pub enum OpenAccess {
 }
 
 /// The access an object is opened with.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Lock {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockKind {
     /// No locks are held. The database may be neither read nor written. Any internally cached data
     /// is considered suspect and subject to verification against the database file before being
     /// used. Other processes can read or write the database as their own locking states permit.
@@ -887,13 +887,13 @@ mod io {
         };
         log::trace!("[{}] lock ({})", state.id, state.db_name);
 
-        let lock = match Lock::from_i32(e_lock) {
+        let lock = match LockKind::from_i32(e_lock) {
             Some(lock) => lock,
             None => return ffi::SQLITE_IOERR_LOCK,
         };
         match state.file.lock(lock) {
             Ok(true) => {
-                state.has_exclusive_lock = lock == Lock::Exclusive;
+                state.has_exclusive_lock = lock == LockKind::Exclusive;
                 log::trace!("[{}] lock={:?} ({})", state.id, lock, state.db_name);
 
                 // If just acquired a exclusive database lock while not having any exclusive lock
@@ -949,13 +949,13 @@ mod io {
         };
         log::trace!("[{}] unlock ({})", state.id, state.db_name);
 
-        let lock = match Lock::from_i32(e_lock) {
+        let lock = match LockKind::from_i32(e_lock) {
             Some(lock) => lock,
             None => return ffi::SQLITE_IOERR_UNLOCK,
         };
         match state.file.unlock(lock) {
             Ok(true) => {
-                state.has_exclusive_lock = lock == Lock::Exclusive;
+                state.has_exclusive_lock = lock == LockKind::Exclusive;
                 log::trace!("[{}] unlock={:?} ({})", state.id, lock, state.db_name);
                 ffi::SQLITE_OK
             }
@@ -1701,7 +1701,7 @@ impl OpenAccess {
     }
 }
 
-impl Lock {
+impl LockKind {
     fn from_i32(lock: i32) -> Option<Self> {
         Some(match lock {
             ffi::SQLITE_LOCK_NONE => Self::None,
@@ -1724,13 +1724,13 @@ impl Lock {
     }
 }
 
-impl PartialOrd for Lock {
+impl PartialOrd for LockKind {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.to_i32().partial_cmp(&other.to_i32())
     }
 }
 
-impl Default for Lock {
+impl Default for LockKind {
     fn default() -> Self {
         Self::None
     }
@@ -1799,9 +1799,9 @@ mod tests {
 
     #[test]
     fn test_lock_order() {
-        assert!(Lock::None < Lock::Shared);
-        assert!(Lock::Shared < Lock::Reserved);
-        assert!(Lock::Reserved < Lock::Pending);
-        assert!(Lock::Pending < Lock::Exclusive);
+        assert!(LockKind::None < LockKind::Shared);
+        assert!(LockKind::Shared < LockKind::Reserved);
+        assert!(LockKind::Reserved < LockKind::Pending);
+        assert!(LockKind::Pending < LockKind::Exclusive);
     }
 }

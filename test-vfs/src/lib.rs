@@ -1,5 +1,6 @@
 use sqlite_vfs::{register, RegisterError};
 
+pub mod lock;
 pub mod vfs;
 
 pub const SQLITE_OK: i32 = 0;

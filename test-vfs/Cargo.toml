@@ -7,7 +7,8 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pretty_env_logger = "0.4"
-sqlite-vfs = { path = "../", default-features = false, features = ["sqlite_test"] }
 durable-object = { path = "../durable-object" }
 log = "0.4"
+pretty_env_logger = "0.4"
+sqlite-vfs = { path = "../", default-features = false, features = ["sqlite_test"] }
+libc = "0.2"

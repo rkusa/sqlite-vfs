@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::connection::Connection;
-use crate::request::{Lock, Request, WalIndexLock};
+use crate::request::{Request, WalIndexLock};
 use crate::response::Response;
 
 pub struct Client {
@@ -25,30 +25,6 @@ impl Client {
                 ErrorKind::Other,
                 "received unexpected response",
             )),
-        }
-    }
-
-    pub fn lock(&mut self, lock: Lock) -> io::Result<Option<Lock>> {
-        let res = self.send(Request::Lock { lock })?;
-        match res {
-            Response::Lock(lock) => Ok(Some(lock)),
-            Response::Denied => Ok(None),
-            _ => Err(io::Error::new(
-                ErrorKind::Other,
-                "received unexpected response",
-            )),
-        }
-    }
-
-    pub fn reserved(&mut self) -> io::Result<bool> {
-        let res = self.send(Request::Reserved)?;
-        if let Response::Reserved(reserved) = res {
-            Ok(reserved)
-        } else {
-            Err(io::Error::new(
-                ErrorKind::Other,
-                "received unexpected response",
-            ))
         }
     }
 

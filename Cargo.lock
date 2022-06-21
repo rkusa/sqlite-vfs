@@ -280,6 +280,7 @@ name = "test-vfs"
 version = "0.1.0"
 dependencies = [
  "durable-object",
+ "libc",
  "log",
  "pretty_env_logger",
  "sqlite-vfs",

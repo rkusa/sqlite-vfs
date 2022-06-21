@@ -6,10 +6,6 @@ pub enum Request<'a> {
     Open {
         db: &'a str,
     },
-    Lock {
-        lock: Lock,
-    },
-    Reserved,
     GetWalIndex {
         region: u32,
     },
@@ -22,16 +18,6 @@ pub enum Request<'a> {
         lock: WalIndexLock,
     },
     DeleteWalIndex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u16)]
-pub enum Lock {
-    None = 1,
-    Shared,
-    Reserved,
-    Pending,
-    Exclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,28 +40,6 @@ impl<'a> Request<'a> {
             1 => Ok(Request::Open {
                 db: std::str::from_utf8(&data[2..]).unwrap(),
             }),
-            2 => {
-                let lock = u16::from_be_bytes(
-                    data[2..4]
-                        .try_into()
-                        .map_err(|err| std::io::Error::new(ErrorKind::UnexpectedEof, err))?,
-                );
-                let lock = match lock {
-                    1 => Lock::None,
-                    2 => Lock::Shared,
-                    3 => Lock::Reserved,
-                    4 => Lock::Pending,
-                    5 => Lock::Exclusive,
-                    lock => {
-                        return Err(std::io::Error::new(
-                            ErrorKind::Other,
-                            format!("invalid lock `{}`", lock),
-                        ))
-                    }
-                };
-                Ok(Request::Lock { lock })
-            }
-            3 => Ok(Request::Reserved),
             4 => {
                 let region = u32::from_be_bytes(
                     data[2..6]
@@ -133,13 +97,6 @@ impl<'a> Request<'a> {
                 buffer.extend_from_slice(&1u16.to_be_bytes()); // type
                 buffer.extend_from_slice(db.as_bytes()); // db path
             }
-            Request::Lock { lock } => {
-                buffer.extend_from_slice(&2u16.to_be_bytes()); // type
-                buffer.extend_from_slice(&(*lock as u16).to_be_bytes()); // lock
-            }
-            Request::Reserved => {
-                buffer.extend_from_slice(&3u16.to_be_bytes()); // type
-            }
             Request::GetWalIndex { region } => {
                 buffer.extend_from_slice(&4u16.to_be_bytes()); // type
                 buffer.extend_from_slice(&region.to_be_bytes());
@@ -172,40 +129,13 @@ impl Default for WalIndexLock {
 mod tests {
     use std::ops::Range;
 
-    use crate::request::{Lock, WalIndexLock};
+    use crate::request::WalIndexLock;
 
     use super::Request;
 
     #[test]
     fn test_request_open_encode_decode() {
         let req = Request::Open { db: "test.db" };
-        let mut encoded = Vec::new();
-        req.encode(&mut encoded);
-        assert_eq!(Request::decode(&encoded).unwrap(), req);
-    }
-
-    #[test]
-    fn test_request_lock_encode_decode() {
-        for i in 1..5 {
-            let req = Request::Lock {
-                lock: match i {
-                    1 => Lock::None,
-                    2 => Lock::Shared,
-                    3 => Lock::Reserved,
-                    4 => Lock::Pending,
-                    5 => Lock::Exclusive,
-                    _ => unreachable!(),
-                },
-            };
-            let mut encoded = Vec::new();
-            req.encode(&mut encoded);
-            assert_eq!(Request::decode(&encoded).unwrap(), req);
-        }
-    }
-
-    #[test]
-    fn test_request_reserved_encode_decode() {
-        let req = Request::Reserved;
         let mut encoded = Vec::new();
         req.encode(&mut encoded);
         assert_eq!(Request::decode(&encoded).unwrap(), req);
