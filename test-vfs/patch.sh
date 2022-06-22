@@ -7,6 +7,10 @@ set -e
 patch test/wal2.test ../patch/wal2.test.patch
 rm test/journal3.test
 
+# The struct created per opened db file is bigger for the test-vfs compared to the original os_unix
+# one, which is why some expected values in the following test need to be updated.
+patch test/dbstatus.test ../patch/dbstatus.test.patch
+
 # Remove e_walauto.test as it requires an actually memory mapped wal index
 rm test/e_walauto.test
 rm test/mmapwarm.test

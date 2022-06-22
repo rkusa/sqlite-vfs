@@ -1677,7 +1677,7 @@ unsafe fn simulate_diskfull_error() -> bool {
 
 impl<V> State<V> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
-        log::error!("{}", err);
+        // log::error!("{}", err);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         no
     }
@@ -1685,7 +1685,7 @@ impl<V> State<V> {
 
 impl<V, F> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
-        log::error!("{}", err);
+        // log::error!("{}", err);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         self.last_errno = no;
         no
