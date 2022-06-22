@@ -409,16 +409,8 @@ mod vfs {
 
         let file = match result {
             Ok(f) => f,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::PermissionDenied | ErrorKind::NotFound
-                ) =>
-            {
-                return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
-            }
             Err(err) => {
-                return state.set_last_error(ffi::SQLITE_IOERR, err);
+                return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
             }
         };
 
