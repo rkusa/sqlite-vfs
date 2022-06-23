@@ -92,7 +92,7 @@ impl Vfs for TestVfs {
     fn access(&self, db: &str, write: bool) -> Result<bool, std::io::Error> {
         let metadata = fs::metadata(db)?;
         let readonly = metadata.permissions().readonly();
-        Ok(!write || readonly)
+        Ok(!write || (write && !readonly))
     }
 
     fn temporary_name(&self) -> String {
