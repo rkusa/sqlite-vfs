@@ -398,7 +398,10 @@ mod vfs {
 
         let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
         let result = state.vfs.open(&name, opts.clone()).or_else(|err| {
-            if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
+            if err.kind() == ErrorKind::PermissionDenied
+                && opts.kind == OpenKind::MainDb
+                && opts.access != OpenAccess::Read
+            {
                 // Try again as readonly
                 opts.access = OpenAccess::Read;
                 state.vfs.open(&name, opts.clone()).map_err(|_| err)
@@ -409,6 +412,21 @@ mod vfs {
 
         let file = match result {
             Ok(f) => f,
+            // e.g. tried to open a directory
+            Err(err) if err.kind() == ErrorKind::Other && opts.access == OpenAccess::Read => {
+                return state.set_last_error(ffi::SQLITE_IOERR, err);
+            }
+            // permission denied for new journal implies that the directory is readonly
+            Err(err)
+                if err.kind() == ErrorKind::PermissionDenied
+                    && matches!(
+                        opts.kind,
+                        OpenKind::SuperJournal | OpenKind::MainJournal | OpenKind::Wal
+                    )
+                    && matches!(opts.access, OpenAccess::Create | OpenAccess::CreateNew) =>
+            {
+                return state.set_last_error(ffi::SQLITE_READONLY_DIRECTORY, err);
+            }
             Err(err) => {
                 return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
             }
@@ -448,10 +466,6 @@ mod vfs {
         z_path: *const c_char,
         _sync_dir: c_int,
     ) -> c_int {
-        let path = CStr::from_ptr(z_path);
-        let path = path.to_string_lossy().to_string();
-        log::trace!("delete name={:?}", path);
-
         // #[cfg(feature = "sqlite_test")]
         // if simulate_io_error() {
         //     return ffi::SQLITE_ERROR;
@@ -462,7 +476,21 @@ mod vfs {
             Err(_) => return ffi::SQLITE_DELETE,
         };
 
-        match state.vfs.delete(path.as_ref()) {
+        let path = match CStr::from_ptr(z_path).to_str() {
+            Ok(name) => name,
+            Err(_) => {
+                return state.set_last_error(
+                    ffi::SQLITE_CANTOPEN,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        "database must be defined and a valid utf8 string",
+                    ),
+                )
+            }
+        };
+        log::trace!("delete name={}", path);
+
+        match state.vfs.delete(path) {
             Ok(_) => ffi::SQLITE_OK,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
@@ -482,13 +510,6 @@ mod vfs {
         flags: c_int,
         p_res_out: *mut c_int,
     ) -> c_int {
-        let name = if z_path.is_null() {
-            None
-        } else {
-            CStr::from_ptr(z_path).to_str().ok()
-        };
-        log::trace!("access z_name={:?} flags={}", name, flags);
-
         #[cfg(feature = "sqlite_test")]
         if simulate_io_error() {
             return ffi::SQLITE_IOERR_ACCESS;
@@ -499,14 +520,24 @@ mod vfs {
             Err(_) => return ffi::SQLITE_ERROR,
         };
 
-        let path = CStr::from_ptr(z_path);
-        // TODO: any way to use OsStr instead?
-        let path = path.to_string_lossy().to_string();
+        let path = match CStr::from_ptr(z_path).to_str() {
+            Ok(name) => name,
+            Err(_) => {
+                return state.set_last_error(
+                    ffi::SQLITE_CANTOPEN,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        "database must be defined and a valid utf8 string",
+                    ),
+                )
+            }
+        };
+        log::trace!("access z_name={} flags={}", path, flags);
 
         let result = match flags {
-            ffi::SQLITE_ACCESS_EXISTS => state.vfs.exists(path.as_ref()),
-            ffi::SQLITE_ACCESS_READ => state.vfs.access(path.as_ref(), false),
-            ffi::SQLITE_ACCESS_READWRITE => state.vfs.access(path.as_ref(), true),
+            ffi::SQLITE_ACCESS_EXISTS => state.vfs.exists(path),
+            ffi::SQLITE_ACCESS_READ => state.vfs.access(path, false),
+            ffi::SQLITE_ACCESS_READWRITE => state.vfs.access(path, true),
             _ => return ffi::SQLITE_IOERR_ACCESS,
         };
 
@@ -530,9 +561,6 @@ mod vfs {
         n_out: c_int,
         z_out: *mut c_char,
     ) -> c_int {
-        let name = CStr::from_ptr(z_path).to_string_lossy();
-        log::trace!("full_pathname name={}", name);
-
         // #[cfg(feature = "sqlite_test")]
         // if simulate_io_error() {
         //     return ffi::SQLITE_ERROR;
@@ -542,7 +570,22 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        let name = match state.vfs.full_pathname(&name).and_then(|name| {
+
+        let path = match CStr::from_ptr(z_path).to_str() {
+            Ok(name) => name,
+            Err(_) => {
+                return state.set_last_error(
+                    ffi::SQLITE_CANTOPEN,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        "database must be defined and a valid utf8 string",
+                    ),
+                )
+            }
+        };
+        log::trace!("full_pathname name={}", path);
+
+        let name = match state.vfs.full_pathname(path).and_then(|name| {
             CString::new(name.to_string()).map_err(|_| {
                 std::io::Error::new(ErrorKind::Other, "name must not contain a nul byte")
             })
@@ -788,7 +831,7 @@ mod vfs {
             Ok(state) => state,
             Err(_) => return ffi::SQLITE_ERROR,
         };
-        if let Some((_, err)) = state.last_error.lock().unwrap().as_ref() {
+        if let Some((eno, err)) = state.last_error.lock().unwrap().as_ref() {
             let msg = match CString::new(err.to_string()) {
                 Ok(msg) => msg,
                 Err(_) => return ffi::SQLITE_ERROR,
@@ -800,6 +843,8 @@ mod vfs {
             }
             let out = slice::from_raw_parts_mut(z_err_msg as *mut u8, msg.len());
             out.copy_from_slice(msg);
+
+            return *eno;
         }
         ffi::SQLITE_OK
     }
@@ -1669,7 +1714,7 @@ unsafe fn simulate_diskfull_error() -> bool {
 
 impl<V> State<V> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
-        // log::error!("{}", err);
+        // log::error!("{} ({})", err, no);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         no
     }
@@ -1677,7 +1722,7 @@ impl<V> State<V> {
 
 impl<V, F> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
-        // log::error!("{}", err);
+        // log::error!("{} ({})", err, no);
         *(self.last_error.lock().unwrap()) = Some((no, err));
         self.last_errno = no;
         no

@@ -35,9 +35,6 @@ impl Vfs for TestVfs {
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, std::io::Error> {
         let path = normalize_path(Path::new(&db));
         if path.is_dir() {
-            if matches!(opts.access, OpenAccess::Create | OpenAccess::CreateNew) {
-                return Err(ErrorKind::PermissionDenied.into());
-            }
             return Err(io::Error::new(ErrorKind::Other, "cannot open directory"));
         }
 
@@ -70,10 +67,15 @@ impl Vfs for TestVfs {
         Ok(Connection {
             path_shm,
             path,
+            // Lock needs to be created right away to ensure there is a free file descriptor for the
+            // additional lock file.
+            lock: if opts.kind == OpenKind::MainDb {
+                Some(Lock::from_file(&file)?)
+            } else {
+                None
+            },
             file,
             file_ino,
-            // Will be set on first use to reduce unnecessary usage of file descriptors.
-            lock: None,
             wal_lock: RangeLock::new(file_ino),
         })
     }
@@ -85,6 +87,12 @@ impl Vfs for TestVfs {
 
     fn exists(&self, db: &str) -> Result<bool, std::io::Error> {
         Ok(Path::new(db).is_file())
+    }
+
+    fn access(&self, db: &str, write: bool) -> Result<bool, std::io::Error> {
+        let metadata = fs::metadata(db)?;
+        let readonly = metadata.permissions().readonly();
+        Ok(!write || readonly)
     }
 
     fn temporary_name(&self) -> String {
