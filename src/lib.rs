@@ -358,7 +358,10 @@ mod vfs {
                         ffi::SQLITE_CANTOPEN,
                         std::io::Error::new(
                             ErrorKind::Other,
-                            "database must be defined and a valid utf8 string",
+                            format!(
+                                "open failed: database must be valid utf8 (received: {:?})",
+                                CStr::from_ptr(z_name)
+                            ),
                         ),
                     )
                 }
@@ -480,10 +483,13 @@ mod vfs {
             Ok(name) => name,
             Err(_) => {
                 return state.set_last_error(
-                    ffi::SQLITE_CANTOPEN,
+                    ffi::SQLITE_ERROR,
                     std::io::Error::new(
                         ErrorKind::Other,
-                        "database must be defined and a valid utf8 string",
+                        format!(
+                            "delete failed: database must be valid utf8 (received: {:?})",
+                            CStr::from_ptr(z_path)
+                        ),
                     ),
                 )
             }
@@ -523,13 +529,16 @@ mod vfs {
         let path = match CStr::from_ptr(z_path).to_str() {
             Ok(name) => name,
             Err(_) => {
-                return state.set_last_error(
-                    ffi::SQLITE_CANTOPEN,
-                    std::io::Error::new(
-                        ErrorKind::Other,
-                        "database must be defined and a valid utf8 string",
-                    ),
-                )
+                log::warn!(
+                    "access failed: database must be valid utf8 (received: {:?})",
+                    CStr::from_ptr(z_path)
+                );
+
+                if let Ok(p_res_out) = p_res_out.as_mut().ok_or_else(null_ptr_error) {
+                    *p_res_out = false as i32;
+                }
+
+                return ffi::SQLITE_OK;
             }
         };
         log::trace!("access z_name={} flags={}", path, flags);
@@ -575,10 +584,13 @@ mod vfs {
             Ok(name) => name,
             Err(_) => {
                 return state.set_last_error(
-                    ffi::SQLITE_CANTOPEN,
+                    ffi::SQLITE_ERROR,
                     std::io::Error::new(
                         ErrorKind::Other,
-                        "database must be defined and a valid utf8 string",
+                        format!(
+                            "full_pathname failed: database must be valid utf8 (received: {:?})",
+                            CStr::from_ptr(z_path)
+                        ),
                     ),
                 )
             }
