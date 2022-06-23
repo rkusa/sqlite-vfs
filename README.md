@@ -20,3 +20,6 @@ This library is still in _prototype_ state and not ready to be used (except for 
 - Memory mapping not supported (`xFetch`/`xUnfetch`)
 - Loading extensions not supported (`xDl*`)
 - Tests run only on UNIX right now (due to `std::os::unix` usage in tests)
+- Directory sync is not supported
+- Sector size is always 1024
+- Device characters is not supported (returns no characteristics right now)

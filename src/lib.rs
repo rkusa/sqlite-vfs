@@ -1441,20 +1441,12 @@ mod io {
     pub unsafe extern "C" fn device_characteristics<F>(_p_file: *mut ffi::sqlite3_file) -> c_int {
         log::trace!("device_characteristics");
 
-        // For now, simply copied from [memfs] without putting in a lot of thought.
-        // [memfs]: (https://github.com/sqlite/sqlite/blob/a959bf53110bfada67a3a52187acd57aa2f34e19/ext/misc/memvfs.c#L271-L276)
+        // The following characteristics are needed to match the expected behavior of the tests.
 
-        // writes of any size are atomic
-        ffi::SQLITE_IOCAP_ATOMIC |
         // after reboot following a crash or power loss, the only bytes in a file that were written
         // at the application level might have changed and that adjacent bytes, even bytes within
         // the same sector are guaranteed to be unchanged
-        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE |
-        // when data is appended to a file, the data is appended first then the size of the file is
-        // extended, never the other way around
-        ffi::SQLITE_IOCAP_SAFE_APPEND |
-        // information is written to disk in the same order as calls to xWrite()
-        ffi::SQLITE_IOCAP_SEQUENTIAL
+        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
     }
 
     /// Create a shared memory file mapping.
