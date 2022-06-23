@@ -1203,10 +1203,8 @@ mod io {
 
             // Write last error number into (int)pArg.
             ffi::SQLITE_FCNTL_LAST_ERRNO => {
-                if let Some((no, _)) = state.last_error.lock().unwrap().as_ref() {
-                    if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
-                        *p_arg = *no;
-                    }
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    *p_arg = state.last_errno;
                 }
                 ffi::SQLITE_OK
             }
