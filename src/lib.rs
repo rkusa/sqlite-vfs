@@ -20,12 +20,9 @@ use std::time::Instant;
 mod ffi;
 
 /// A file opened by [Vfs].
-pub trait DatabaseHandle: Sync
-where
-    Self: Sized,
-{
+pub trait DatabaseHandle: Sync {
     /// An optional trait used to store a WAL (write-ahead log).
-    type WalIndex: WalIndex<Self>;
+    type WalIndex: WalIndex;
 
     /// Return the current size in bytes of the database.
     fn size(&self) -> Result<u64, std::io::Error>;
@@ -72,6 +69,8 @@ where
     fn moved(&self) -> Result<bool, std::io::Error> {
         Ok(false)
     }
+
+    fn wal_index(&self) -> Result<Self::WalIndex, std::io::Error>;
 }
 
 /// A virtual file system for SQLite.
@@ -102,20 +101,20 @@ pub trait Vfs: Sync {
     }
 }
 
-pub trait WalIndex<T>: Sync {
+pub trait WalIndex: Sync {
     fn enabled() -> bool {
         true
     }
 
-    fn map(handle: &mut T, region: u32) -> Result<[u8; 32768], std::io::Error>;
-    fn lock(handle: &mut T, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, std::io::Error>;
-    fn delete(handle: &mut T) -> Result<(), std::io::Error>;
+    fn map(&mut self, region: u32) -> Result<[u8; 32768], std::io::Error>;
+    fn lock(&mut self, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, std::io::Error>;
+    fn delete(self) -> Result<(), std::io::Error>;
 
-    fn pull(_handle: &mut T, _region: u32, _data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
+    fn pull(&mut self, _region: u32, _data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
         Ok(())
     }
 
-    fn push(_handle: &mut T, _region: u32, _data: &[u8; 32768]) -> Result<(), std::io::Error> {
+    fn push(&mut self, _region: u32, _data: &[u8; 32768]) -> Result<(), std::io::Error> {
         Ok(())
     }
 }
@@ -307,13 +306,13 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
 const MAX_PATH_LENGTH: usize = 512;
 
 #[repr(C)]
-struct FileState<V, F> {
+struct FileState<V, F: DatabaseHandle> {
     base: ffi::sqlite3_file,
     ext: MaybeUninit<FileExt<V, F>>,
 }
 
 #[repr(C)]
-struct FileExt<V, F> {
+struct FileExt<V, F: DatabaseHandle> {
     vfs: Arc<V>,
     vfs_name: CString,
     db_name: String,
@@ -323,7 +322,8 @@ struct FileExt<V, F> {
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
     /// The last error number of this file/connection (not shared with the VFS).
     last_errno: i32,
-    wal_index: HashMap<u32, Pin<Box<[u8; 32768]>>>,
+    wal_index: Option<F::WalIndex>,
+    wal_index_regions: HashMap<u32, Pin<Box<[u8; 32768]>>>,
     wal_index_locks: HashMap<u8, WalIndexLock>,
     has_exclusive_lock: bool,
     id: usize,
@@ -448,7 +448,8 @@ mod vfs {
             delete_on_close: opts.delete_on_close,
             last_error: Arc::clone(&state.last_error),
             last_errno: 0,
-            wal_index: Default::default(),
+            wal_index: None,
+            wal_index_regions: Default::default(),
             wal_index_locks: Default::default(),
             has_exclusive_lock: false,
             id: state.next_id,
@@ -869,7 +870,9 @@ mod io {
     use super::*;
 
     /// Close a file.
-    pub unsafe extern "C" fn close<V: Vfs, F>(p_file: *mut ffi::sqlite3_file) -> c_int {
+    pub unsafe extern "C" fn close<V: Vfs, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+    ) -> c_int {
         if let Some(f) = (p_file as *mut FileState<V, F>).as_mut() {
             let ext = f.ext.assume_init_mut();
             if ext.delete_on_close {
@@ -1090,15 +1093,16 @@ mod io {
                             "[{}] acquired exclusive db lock, pulling wal index changes",
                             state.id,
                         );
-                        for (region, data) in &mut state.wal_index {
-                            if let Err(err) =
-                                F::WalIndex::pull(&mut state.file, *region as u32, data)
-                            {
-                                log::error!(
-                                    "[{}] pulling wal index changes failed: {}",
-                                    state.id,
-                                    err
-                                )
+
+                        if let Some(wal_index) = state.wal_index.as_mut() {
+                            for (region, data) in &mut state.wal_index_regions {
+                                if let Err(err) = wal_index.pull(*region as u32, data) {
+                                    log::error!(
+                                        "[{}] pulling wal index changes failed: {}",
+                                        state.id,
+                                        err
+                                    )
+                                }
                             }
                         }
                     }
@@ -1487,13 +1491,23 @@ mod io {
             );
         }
 
-        let entry = state.wal_index.entry(region_ix as u32);
+        let entry = state.wal_index_regions.entry(region_ix as u32);
         match entry {
             Entry::Occupied(mut entry) => {
                 *pp = entry.get_mut().as_mut_ptr() as *mut c_void;
             }
             Entry::Vacant(entry) => {
-                let m = match F::WalIndex::map(&mut state.file, region_ix as u32) {
+                let wal_index = match state.wal_index.as_mut() {
+                    Some(wal_index) => wal_index,
+                    None => state.wal_index.get_or_insert(match state.file.wal_index() {
+                        Ok(wal_index) => wal_index,
+                        Err(err) => {
+                            return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
+                        }
+                    }),
+                };
+
+                let m = match wal_index.map(region_ix as u32) {
                     Ok(m) => Box::pin(m),
                     Err(err) => {
                         return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
@@ -1538,6 +1552,16 @@ mod io {
             (false, _) => WalIndexLock::None,
         };
 
+        let wal_index = match state.wal_index.as_mut() {
+            Some(wal_index) => wal_index,
+            None => state.wal_index.get_or_insert(match state.file.wal_index() {
+                Ok(wal_index) => wal_index,
+                Err(err) => {
+                    return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
+                }
+            }),
+        };
+
         if locking {
             let has_exclusive = state
                 .wal_index_locks
@@ -1549,8 +1573,8 @@ mod io {
                     "[{}] does not have wal index write lock, pulling changes",
                     state.id
                 );
-                for (region, data) in &mut state.wal_index {
-                    if let Err(err) = F::WalIndex::pull(&mut state.file, *region as u32, data) {
+                for (region, data) in &mut state.wal_index_regions {
+                    if let Err(err) = wal_index.pull(*region as u32, data) {
                         return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
                     }
                 }
@@ -1567,15 +1591,15 @@ mod io {
                     "[{}] releasing an exclusive lock, pushing wal index changes",
                     state.id,
                 );
-                for (region, data) in &mut state.wal_index {
-                    if let Err(err) = F::WalIndex::push(&mut state.file, *region as u32, data) {
+                for (region, data) in &mut state.wal_index_regions {
+                    if let Err(err) = wal_index.push(*region as u32, data) {
                         return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
                     }
                 }
             }
         }
 
-        match F::WalIndex::lock(&mut state.file, range.clone(), lock) {
+        match wal_index.lock(range.clone(), lock) {
             Ok(true) => {
                 for region in range {
                     state.wal_index_locks.insert(region, lock);
@@ -1595,13 +1619,19 @@ mod io {
         };
         log::trace!("[{}] shm_barrier ({})", state.id, state.db_name);
 
+        let wal_index = if let Some(wal_index) = state.wal_index.as_mut() {
+            wal_index
+        } else {
+            return;
+        };
+
         if state.has_exclusive_lock {
             log::trace!(
                 "[{}] has exclusive db lock, pushing wal index changes",
                 state.id,
             );
-            for (region, data) in &mut state.wal_index {
-                if let Err(err) = F::WalIndex::push(&mut state.file, *region as u32, data) {
+            for (region, data) in &mut state.wal_index_regions {
+                if let Err(err) = wal_index.push(*region as u32, data) {
                     log::error!("[{}] pushing wal index changes failed: {}", state.id, err)
                 }
             }
@@ -1619,8 +1649,8 @@ mod io {
                 "[{}] does not have wal index write lock, pulling changes",
                 state.id
             );
-            for (region, data) in &mut state.wal_index {
-                if let Err(err) = F::WalIndex::pull(&mut state.file, *region as u32, data) {
+            for (region, data) in &mut state.wal_index_regions {
+                if let Err(err) = wal_index.pull(*region as u32, data) {
                     log::error!("[{}] pulling wal index changes failed: {}", state.id, err)
                 }
             }
@@ -1643,17 +1673,18 @@ mod io {
             state.db_name
         );
 
-        state.wal_index.clear();
+        state.wal_index_regions.clear();
         state.wal_index_locks.clear();
 
         if delete_flags == 1 {
-            match F::WalIndex::delete(&mut state.file) {
-                Ok(()) => ffi::SQLITE_OK,
-                Err(err) => state.set_last_error(ffi::SQLITE_ERROR, err),
+            if let Some(wal_index) = state.wal_index.take() {
+                if let Err(err) = wal_index.delete() {
+                    return state.set_last_error(ffi::SQLITE_ERROR, err);
+                }
             }
-        } else {
-            ffi::SQLITE_OK
         }
+
+        ffi::SQLITE_OK
     }
 }
 
@@ -1722,7 +1753,7 @@ impl<V> State<V> {
     }
 }
 
-impl<V, F> FileExt<V, F> {
+impl<V, F: DatabaseHandle> FileExt<V, F> {
     fn set_last_error(&mut self, no: i32, err: std::io::Error) -> i32 {
         // log::error!("{} ({})", err, no);
         *(self.last_error.lock().unwrap()) = Some((no, err));
@@ -1743,7 +1774,7 @@ unsafe fn vfs_state<'a, V>(ptr: *mut ffi::sqlite3_vfs) -> Result<&'a mut State<V
     Ok(state)
 }
 
-unsafe fn file_state<'a, V, F>(
+unsafe fn file_state<'a, V, F: DatabaseHandle>(
     ptr: *mut ffi::sqlite3_file,
 ) -> Result<&'a mut FileExt<V, F>, std::io::Error> {
     let f = (ptr as *mut FileState<V, F>)
@@ -1868,24 +1899,20 @@ impl Default for LockKind {
 #[derive(Default)]
 pub struct WalDisabled;
 
-impl<T> WalIndex<T> for WalDisabled {
+impl WalIndex for WalDisabled {
     fn enabled() -> bool {
         false
     }
 
-    fn map(_handle: &mut T, _region: u32) -> Result<[u8; 32768], std::io::Error> {
+    fn map(&mut self, _region: u32) -> Result<[u8; 32768], std::io::Error> {
         Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
     }
 
-    fn lock(
-        _handle: &mut T,
-        _locks: Range<u8>,
-        _lock: WalIndexLock,
-    ) -> Result<bool, std::io::Error> {
+    fn lock(&mut self, _locks: Range<u8>, _lock: WalIndexLock) -> Result<bool, std::io::Error> {
         Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
     }
 
-    fn delete(_handle: &mut T) -> Result<(), std::io::Error> {
+    fn delete(self) -> Result<(), std::io::Error> {
         Ok(())
     }
 }

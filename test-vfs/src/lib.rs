@@ -1,5 +1,6 @@
 use sqlite_vfs::{register, RegisterError};
 
+pub mod file_lock;
 pub mod lock;
 pub mod range_lock;
 pub mod vfs;
