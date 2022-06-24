@@ -1,7 +1,7 @@
 use std::borrow::Cow;
-use std::fs::{self, File};
+use std::fs::{self, File, Permissions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::prelude::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -43,17 +43,25 @@ impl Vfs for TestVfs {
 
         let mut o = fs::OpenOptions::new();
         o.read(true).write(opts.access != OpenAccess::Read);
-        match opts.access {
+        let is_create = match opts.access {
             OpenAccess::Create => {
                 o.create(true);
+                true
             }
             OpenAccess::CreateNew => {
                 o.create_new(true);
+                true
             }
-            _ => {}
-        }
+            _ => false,
+        };
         let file = o.open(&path)?;
-        let file_ino = file.metadata()?.ino();
+        let metadata = file.metadata()?;
+        let file_ino = metadata.ino();
+
+        if is_create && matches!(opts.kind, OpenKind::Wal | OpenKind::MainJournal) {
+            let mode = permissions(&path)?;
+            fs::set_permissions(&path, Permissions::from_mode(mode))?;
+        }
 
         Ok(Connection {
             path,
@@ -216,6 +224,9 @@ impl sqlite_vfs::DatabaseHandle for Connection {
             file_lock.wait_shared();
         }
 
+        let mode = permissions(&self.path)?;
+        fs::set_permissions(&path, Permissions::from_mode(mode))?;
+
         Ok(WalConnection {
             path,
             file_lock,
@@ -309,4 +320,14 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     ret
+}
+
+fn permissions(path: &Path) -> io::Result<u32> {
+    let path = path.with_extension(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.split_once('-').map(|(f, _)| f).unwrap_or(ext))
+            .unwrap_or("db"),
+    );
+    Ok(fs::metadata(&path)?.permissions().mode())
 }
