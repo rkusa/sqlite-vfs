@@ -400,33 +400,39 @@ mod vfs {
         };
 
         let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
-        let result = state.vfs.open(&name, opts.clone()).or_else(|err| {
-            if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
-                // Try again as readonly
-                opts.access = OpenAccess::Read;
-                state.vfs.open(&name, opts.clone()).map_err(|_| err)
-            } else {
-                Err(err)
-            }
-        });
-
-        let file = match result {
-            Ok(f) => f,
-            // e.g. tried to open a directory
-            Err(err) if err.kind() == ErrorKind::Other && opts.access == OpenAccess::Read => {
-                return state.set_last_error(ffi::SQLITE_IOERR, err);
-            }
-            // permission denied for new journal implies that the directory is readonly
+        let result = state.vfs.open(&name, opts.clone());
+        let result = match result {
+            Ok(f) => Ok(f),
+            // handle creation failure due to readonly directory
             Err(err)
                 if err.kind() == ErrorKind::PermissionDenied
                     && matches!(
                         opts.kind,
                         OpenKind::SuperJournal | OpenKind::MainJournal | OpenKind::Wal
                     )
-                    && matches!(opts.access, OpenAccess::Create | OpenAccess::CreateNew) =>
+                    && matches!(opts.access, OpenAccess::Create | OpenAccess::CreateNew)
+                    && !state.vfs.exists(&name).unwrap_or(false) =>
             {
                 return state.set_last_error(ffi::SQLITE_READONLY_DIRECTORY, err);
             }
+
+            // Try again as readonly
+            Err(err)
+                if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read =>
+            {
+                opts.access = OpenAccess::Read;
+                state.vfs.open(&name, opts.clone()).map_err(|_| err)
+            }
+
+            // e.g. tried to open a directory
+            Err(err) if err.kind() == ErrorKind::Other && opts.access == OpenAccess::Read => {
+                return state.set_last_error(ffi::SQLITE_IOERR, err);
+            }
+
+            Err(err) => Err(err),
+        };
+        let file = match result {
+            Ok(f) => f,
             Err(err) => {
                 return state.set_last_error(ffi::SQLITE_CANTOPEN, err);
             }
@@ -1536,7 +1542,6 @@ mod io {
         }
 
         if readonly {
-            log::trace!("shm_map readonly");
             ffi::SQLITE_READONLY
         } else {
             ffi::SQLITE_OK

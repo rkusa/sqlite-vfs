@@ -60,8 +60,9 @@ impl Vfs for TestVfs {
         let file_ino = metadata.ino();
 
         if is_create && matches!(opts.kind, OpenKind::Wal | OpenKind::MainJournal) {
-            let mode = permissions(&path)?;
-            fs::set_permissions(&path, Permissions::from_mode(mode)).ok();
+            if let Ok(mode) = permissions(&path) {
+                fs::set_permissions(&path, Permissions::from_mode(mode)).ok();
+            }
         }
 
         if opts.kind == OpenKind::Wal {
