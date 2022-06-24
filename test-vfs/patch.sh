@@ -1,12 +1,6 @@
 #!/bin/bash
 set -e
 
-# Remove unix file system specific tests from wal2 that expect the db-shm to be persisted to disk
-# and also care about file permissions for db-wal, db-shm and journal files. Since the test VFS
-# isn't meant for saving files to disk, those tests are removed.
-patch test/wal2.test ../patch/wal2.test.patch
-rm test/journal3.test
-
 # The struct created per opened db file is bigger for the test-vfs compared to the original os_unix
 # one, which is why some expected values in the following test need to be updated.
 patch test/dbstatus.test ../patch/dbstatus.test.patch
