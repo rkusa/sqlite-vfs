@@ -30,6 +30,7 @@ pub struct WalConnection {
     path: PathBuf,
     file_lock: FileLock,
     wal_lock: RangeLock,
+    readonly: bool,
 }
 
 impl Vfs for TestVfs {
@@ -60,7 +61,29 @@ impl Vfs for TestVfs {
 
         if is_create && matches!(opts.kind, OpenKind::Wal | OpenKind::MainJournal) {
             let mode = permissions(&path)?;
-            fs::set_permissions(&path, Permissions::from_mode(mode))?;
+            fs::set_permissions(&path, Permissions::from_mode(mode)).ok();
+        }
+
+        if opts.kind == OpenKind::Wal {
+            // ensure wal index access
+            let path = path.with_extension(format!(
+                "{}-shm",
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.split_once('-').map(|(f, _)| f).unwrap_or(ext))
+                    .unwrap_or("db")
+            ));
+            if path.exists()
+                && fs::metadata(&path)
+                    .map(|m| m.permissions().mode())
+                    .unwrap_or(0o100000)
+                    <= 0o100000
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "cannot read .db-shm file",
+                ));
+            }
         }
 
         Ok(Connection {
@@ -186,7 +209,7 @@ impl sqlite_vfs::DatabaseHandle for Connection {
         Ok(ino == 0 || ino != self.file_ino)
     }
 
-    fn wal_index(&self) -> Result<Self::WalIndex, std::io::Error> {
+    fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error> {
         let path = self.path.with_extension(format!(
             "{}-shm",
             self.path
@@ -195,23 +218,36 @@ impl sqlite_vfs::DatabaseHandle for Connection {
                 .map(|ext| ext.split_once('-').map(|(f, _)| f).unwrap_or(ext))
                 .unwrap_or("db")
         ));
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        let mut file_lock = FileLock::new(file)?;
-        if file_lock.exclusive() {
+        let is_new = !path.exists();
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        if !readonly {
+            opts.write(true).create(true).truncate(false);
+        }
+
+        let file = opts.open(&path)?;
+        let mut file_lock = FileLock::new(file);
+        if !readonly && file_lock.exclusive() {
             // If it is the first connection to open the database, truncate the index.
             let new_file = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&path)?;
+                .open(&path)
+                .map_err(|err| err)?;
 
-            let new_lock = FileLock::new(new_file)?;
+            let new_lock = FileLock::new(new_file);
+
+            if is_new {
+                let mode = permissions(&self.path)?;
+                let perm = Permissions::from_mode(mode);
+                // Match permissions of main db file, but don't downgrade to readonly.
+                if !perm.readonly() {
+                    fs::set_permissions(&path, perm)?;
+                }
+            }
 
             // Transition previous lock to shared before getting a shared on the new file
             // descriptor to make sure that there isn't any other concurrent process/thread getting
@@ -224,13 +260,11 @@ impl sqlite_vfs::DatabaseHandle for Connection {
             file_lock.wait_shared();
         }
 
-        let mode = permissions(&self.path)?;
-        fs::set_permissions(&path, Permissions::from_mode(mode))?;
-
         Ok(WalConnection {
             path,
             file_lock,
             wal_lock: RangeLock::new(self.file_ino),
+            readonly,
         })
     }
 }
@@ -257,6 +291,23 @@ impl WalIndex for WalConnection {
     fn pull(&mut self, region: u32, data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
         let current_size = self.file_lock.file().metadata()?.size();
         let min_size = (region as u64 + 1) * 32768;
+        if !self.readonly && current_size < min_size {
+            self.file_lock.file().set_len(min_size)?;
+        }
+
+        self.file_lock
+            .file()
+            .seek(SeekFrom::Start(region as u64 * 32768))?;
+        match self.file_lock.file().read_exact(data) {
+            Ok(()) => Ok(()),
+            Err(err) if self.readonly && err.kind() == ErrorKind::UnexpectedEof => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), std::io::Error> {
+        let current_size = self.file_lock.file().metadata()?.size();
+        let min_size = (region as u64 + 1) * 32768;
         if current_size < min_size {
             self.file_lock.file().set_len(min_size)?;
         }
@@ -264,29 +315,8 @@ impl WalIndex for WalConnection {
         self.file_lock
             .file()
             .seek(SeekFrom::Start(region as u64 * 32768))?;
-        self.file_lock.file().read_exact(data)?;
-
-        Ok(())
-    }
-
-    fn push(&mut self, region: u32, data: &[u8; 32768]) -> Result<(), std::io::Error> {
-        let mut shm = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-
-        let current_size = shm.metadata()?.size();
-        let min_size = (region as u64 + 1) * 32768;
-        if current_size < min_size {
-            shm.set_len(min_size)?;
-        }
-
-        shm.seek(SeekFrom::Start(region as u64 * 32768))?;
-        shm.write_all(data)?;
-        // shm.flush()?;
-        shm.sync_all()?;
+        self.file_lock.file().write_all(data)?;
+        self.file_lock.file().sync_all()?;
 
         Ok(())
     }

@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::prelude::FromRawFd;
 
@@ -13,11 +12,11 @@ pub struct FileLock {
 }
 
 impl FileLock {
-    pub fn new(file: File) -> io::Result<Self> {
-        Ok(Self {
+    pub fn new(file: File) -> Self {
+        Self {
             fd: file.as_raw_fd(),
             file: Some(file),
-        })
+        }
     }
 
     pub fn file(&mut self) -> &mut File {

@@ -5,10 +5,6 @@ set -e
 # one, which is why some expected values in the following test need to be updated.
 patch test/dbstatus.test ../patch/dbstatus.test.patch
 
-# Remove e_walauto.test as it requires an actually memory mapped wal index
-rm test/e_walauto.test
-rm test/mmapwarm.test
-
 # Remove external_reader.test as the unix-specific SQLITE_FCNTL_EXTERNAL_READER is not implemented.
 rm test/external_reader.test
 

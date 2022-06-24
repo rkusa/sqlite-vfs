@@ -70,7 +70,7 @@ pub trait DatabaseHandle: Sync {
         Ok(false)
     }
 
-    fn wal_index(&self) -> Result<Self::WalIndex, std::io::Error>;
+    fn wal_index(&self, readonly: bool) -> Result<Self::WalIndex, std::io::Error>;
 }
 
 /// A virtual file system for SQLite.
@@ -322,7 +322,7 @@ struct FileExt<V, F: DatabaseHandle> {
     last_error: Arc<Mutex<Option<(i32, std::io::Error)>>>,
     /// The last error number of this file/connection (not shared with the VFS).
     last_errno: i32,
-    wal_index: Option<F::WalIndex>,
+    wal_index: Option<(F::WalIndex, bool)>,
     wal_index_regions: HashMap<u32, Pin<Box<[u8; 32768]>>>,
     wal_index_locks: HashMap<u8, WalIndexLock>,
     has_exclusive_lock: bool,
@@ -401,10 +401,7 @@ mod vfs {
 
         let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
         let result = state.vfs.open(&name, opts.clone()).or_else(|err| {
-            if err.kind() == ErrorKind::PermissionDenied
-                && opts.kind == OpenKind::MainDb
-                && opts.access != OpenAccess::Read
-            {
+            if err.kind() == ErrorKind::PermissionDenied && opts.access != OpenAccess::Read {
                 // Try again as readonly
                 opts.access = OpenAccess::Read;
                 state.vfs.open(&name, opts.clone()).map_err(|_| err)
@@ -1094,7 +1091,7 @@ mod io {
                             state.id,
                         );
 
-                        if let Some(wal_index) = state.wal_index.as_mut() {
+                        if let Some((wal_index, _)) = state.wal_index.as_mut() {
                             for (region, data) in &mut state.wal_index_regions {
                                 if let Err(err) = wal_index.pull(*region as u32, data) {
                                     log::error!(
@@ -1491,34 +1488,59 @@ mod io {
             );
         }
 
+        let (wal_index, readonly) = match state.wal_index.as_mut() {
+            Some((wal_index, readonly)) => (wal_index, *readonly),
+            None => {
+                let (wal_index, readonly) = state.wal_index.get_or_insert(
+                    match state
+                        .file
+                        .wal_index(false)
+                        .map(|wal_index| (wal_index, false))
+                        .or_else(|err| {
+                            if err.kind() == ErrorKind::PermissionDenied {
+                                // Try again as readonly
+                                state
+                                    .file
+                                    .wal_index(true)
+                                    .map(|wal_index| (wal_index, true))
+                                    .map_err(|_| err)
+                            } else {
+                                Err(err)
+                            }
+                        }) {
+                        Ok((wal_index, readonly)) => (wal_index, readonly),
+                        Err(err) => {
+                            return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
+                        }
+                    },
+                );
+                (wal_index, *readonly)
+            }
+        };
+
         let entry = state.wal_index_regions.entry(region_ix as u32);
         match entry {
             Entry::Occupied(mut entry) => {
                 *pp = entry.get_mut().as_mut_ptr() as *mut c_void;
             }
             Entry::Vacant(entry) => {
-                let wal_index = match state.wal_index.as_mut() {
-                    Some(wal_index) => wal_index,
-                    None => state.wal_index.get_or_insert(match state.file.wal_index() {
-                        Ok(wal_index) => wal_index,
-                        Err(err) => {
-                            return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
-                        }
-                    }),
-                };
-
-                let m = match wal_index.map(region_ix as u32) {
+                let mut m = match wal_index.map(region_ix as u32) {
                     Ok(m) => Box::pin(m),
                     Err(err) => {
                         return state.set_last_error(ffi::SQLITE_IOERR_SHMMAP, err);
                     }
                 };
-                let m = entry.insert(m);
                 *pp = m.as_mut_ptr() as *mut c_void;
+                entry.insert(m);
             }
         }
 
-        ffi::SQLITE_OK
+        if readonly {
+            log::trace!("shm_map readonly");
+            ffi::SQLITE_READONLY
+        } else {
+            ffi::SQLITE_OK
+        }
     }
 
     /// Perform locking on a shared-memory segment.
@@ -1552,14 +1574,17 @@ mod io {
             (false, _) => WalIndexLock::None,
         };
 
-        let wal_index = match state.wal_index.as_mut() {
-            Some(wal_index) => wal_index,
-            None => state.wal_index.get_or_insert(match state.file.wal_index() {
-                Ok(wal_index) => wal_index,
-                Err(err) => {
-                    return state.set_last_error(ffi::SQLITE_IOERR_SHMLOCK, err);
-                }
-            }),
+        let (wal_index, readonly) = match state.wal_index.as_mut() {
+            Some((wal_index, readonly)) => (wal_index, *readonly),
+            None => {
+                return state.set_last_error(
+                    ffi::SQLITE_IOERR_SHMLOCK,
+                    std::io::Error::new(
+                        ErrorKind::Other,
+                        "trying to lock wal index, which isn't created yet",
+                    ),
+                )
+            }
         };
 
         if locking {
@@ -1586,7 +1611,7 @@ mod io {
                 .any(|(region, lock)| *lock == WalIndexLock::Exclusive && range.contains(region));
 
             // push index changes when moving from any exclusive lock to no exclusive locks
-            if releases_any_exclusive {
+            if releases_any_exclusive && !readonly {
                 log::trace!(
                     "[{}] releasing an exclusive lock, pushing wal index changes",
                     state.id,
@@ -1619,13 +1644,13 @@ mod io {
         };
         log::trace!("[{}] shm_barrier ({})", state.id, state.db_name);
 
-        let wal_index = if let Some(wal_index) = state.wal_index.as_mut() {
-            wal_index
+        let (wal_index, readonly) = if let Some((wal_index, readonly)) = state.wal_index.as_mut() {
+            (wal_index, *readonly)
         } else {
             return;
         };
 
-        if state.has_exclusive_lock {
+        if state.has_exclusive_lock && !readonly {
             log::trace!(
                 "[{}] has exclusive db lock, pushing wal index changes",
                 state.id,
@@ -1677,9 +1702,11 @@ mod io {
         state.wal_index_locks.clear();
 
         if delete_flags == 1 {
-            if let Some(wal_index) = state.wal_index.take() {
-                if let Err(err) = wal_index.delete() {
-                    return state.set_last_error(ffi::SQLITE_ERROR, err);
+            if let Some((wal_index, readonly)) = state.wal_index.take() {
+                if !readonly {
+                    if let Err(err) = wal_index.delete() {
+                        return state.set_last_error(ffi::SQLITE_ERROR, err);
+                    }
                 }
             }
         }
