@@ -725,4 +725,10 @@ extern "C" {
     ) -> *mut ::std::os::raw::c_char;
 
     pub fn sqlite3_vfs_find(z_vfs_name: *const ::std::os::raw::c_char) -> *mut sqlite3_vfs;
+
+    pub fn sqlite3_uri_boolean(
+        z_filename: *const ::std::os::raw::c_char,
+        z_param: *const ::std::os::raw::c_char,
+        b_dflt: i32,
+    ) -> i32;
 }

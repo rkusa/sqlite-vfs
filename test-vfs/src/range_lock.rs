@@ -6,6 +6,7 @@ use std::{env, io};
 
 use sqlite_vfs::WalIndexLock as LockKind;
 
+use crate::file_lock::FileLock;
 use crate::lock::{flock_exclusive, flock_shared, flock_unlock};
 
 /// SQLite's default locking on UNIX systems is quite involved to work around certain limitations
@@ -32,6 +33,16 @@ impl RangeLock {
     }
 
     pub fn lock(&mut self, range: Range<u8>, to: LockKind) -> io::Result<bool> {
+        // get exclusive lock on file descriptor that acts as a mutex
+        let mutex = FileLock::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(env::temp_dir().join(format!("{}_m.lck", self.ino)))?,
+        );
+        mutex.wait_exclusive(); // is unlocked as soon as mutex is dropped
+
         for i in range.clone() {
             let (fd, current) = match self.locks.get(&i) {
                 Some(fd) => fd,

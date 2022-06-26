@@ -39,6 +39,10 @@ impl FileLock {
     pub fn exclusive(&self) -> bool {
         flock_exclusive(self.fd)
     }
+
+    pub fn wait_exclusive(&self) {
+        flock_wait_exclusive(self.fd)
+    }
 }
 
 pub(crate) fn flock_wait_shared(fd: RawFd) {
@@ -50,6 +54,17 @@ pub(crate) fn flock_wait_shared(fd: RawFd) {
 
     let err = std::io::Error::last_os_error();
     panic!("lock shared failed: {}", err);
+}
+
+pub(crate) fn flock_wait_exclusive(fd: RawFd) {
+    unsafe {
+        if libc::flock(fd, libc::LOCK_EX) == 0 {
+            return;
+        }
+    }
+
+    let err = std::io::Error::last_os_error();
+    panic!("lock exclusive failed: {}", err);
 }
 
 impl Drop for FileLock {

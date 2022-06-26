@@ -234,7 +234,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xCheckReservedLock: Some(io::check_reserved_lock::<V, F>),
         xFileControl: Some(io::file_control::<V, F>),
         xSectorSize: Some(io::sector_size::<F>),
-        xDeviceCharacteristics: Some(io::device_characteristics::<F>),
+        xDeviceCharacteristics: Some(io::device_characteristics::<V, F>),
         xShmMap: Some(io::shm_map::<V, F>),
         xShmLock: Some(io::shm_lock::<V, F>),
         xShmBarrier: Some(io::shm_barrier::<V, F>),
@@ -329,6 +329,7 @@ struct FileExt<V, F: DatabaseHandle> {
     id: usize,
     chunk_size: Option<usize>,
     persist_wal: bool,
+    powersafe_overwrite: bool,
 }
 
 // Example mem-fs implementation:
@@ -400,6 +401,14 @@ mod vfs {
             }
         };
 
+        let mut powersafe_overwrite = true;
+        if flags & ffi::SQLITE_OPEN_URI > 0 && name.is_some() {
+            let param = b"psow\0";
+            if ffi::sqlite3_uri_boolean(z_name, param.as_ptr() as *const c_char, 1) == 0 {
+                powersafe_overwrite = false;
+            }
+        }
+
         let name = name.map_or_else(|| state.vfs.temporary_name(), String::from);
         let result = state.vfs.open(&name, opts.clone());
         let result = match result {
@@ -459,6 +468,7 @@ mod vfs {
             id: state.next_id,
             chunk_size: None,
             persist_wal: false,
+            powersafe_overwrite,
         });
         state.next_id = state.next_id.overflowing_add(1).0;
 
@@ -1337,8 +1347,19 @@ mod io {
                 ffi::SQLITE_OK
             }
 
-            // Set or query the persistent "powersafe-overwrite" or "PSOW" setting. Not implemented.
-            ffi::SQLITE_FCNTL_POWERSAFE_OVERWRITE => ffi::SQLITE_NOTFOUND,
+            // Set or query the persistent "powersafe-overwrite" or "PSOW" setting.
+            ffi::SQLITE_FCNTL_POWERSAFE_OVERWRITE => {
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    if *p_arg < 0 {
+                        // query current setting
+                        *p_arg = state.powersafe_overwrite as i32;
+                    } else {
+                        state.powersafe_overwrite = *p_arg == 1;
+                    }
+                };
+
+                ffi::SQLITE_OK
+            }
 
             // Optionally intercept PRAGMA statements. Always fall back to normal pragma processing.
             ffi::SQLITE_FCNTL_PRAGMA => ffi::SQLITE_NOTFOUND,
@@ -1458,15 +1479,26 @@ mod io {
     }
 
     /// Return the device characteristic flags supported by a file.
-    pub unsafe extern "C" fn device_characteristics<F>(_p_file: *mut ffi::sqlite3_file) -> c_int {
-        log::trace!("device_characteristics");
+    pub unsafe extern "C" fn device_characteristics<V, F: DatabaseHandle>(
+        p_file: *mut ffi::sqlite3_file,
+    ) -> c_int {
+        let state = match file_state::<V, F>(p_file) {
+            Ok(f) => f,
+            Err(_) => return ffi::SQLITE_IOERR_SHMMAP,
+        };
+
+        log::trace!("[{}] device_characteristics", state.id,);
 
         // The following characteristics are needed to match the expected behavior of the tests.
 
         // after reboot following a crash or power loss, the only bytes in a file that were written
         // at the application level might have changed and that adjacent bytes, even bytes within
         // the same sector are guaranteed to be unchanged
-        ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
+        if state.powersafe_overwrite {
+            ffi::SQLITE_IOCAP_POWERSAFE_OVERWRITE
+        } else {
+            0
+        }
     }
 
     /// Create a shared memory file mapping.
