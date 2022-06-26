@@ -29,3 +29,8 @@ rm test/speed4p.test
 # Remove tests that only test a specific built-in VFS
 rm test/unixexcl.test
 
+# Page size for wal index is currently hard coded to 32768 and not retrieved from the actual page
+# size of the system. The following test changes the page size via a syscall and tests that the
+# changes apply. This is currently not supported in the VFS.
+rm test/wal64k.test
+
