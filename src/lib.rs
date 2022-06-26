@@ -328,6 +328,7 @@ struct FileExt<V, F: DatabaseHandle> {
     has_exclusive_lock: bool,
     id: usize,
     chunk_size: Option<usize>,
+    persist_wal: bool,
 }
 
 // Example mem-fs implementation:
@@ -457,6 +458,7 @@ mod vfs {
             has_exclusive_lock: false,
             id: state.next_id,
             chunk_size: None,
+            persist_wal: false,
         });
         state.next_id = state.next_id.overflowing_add(1).0;
 
@@ -1307,8 +1309,19 @@ mod io {
             // programs. Not implemented.
             ffi::SQLITE_FCNTL_WIN32_AV_RETRY => ffi::SQLITE_NOTFOUND,
 
-            // Enable or disable the persistent WAL setting. Not implemented.
-            ffi::SQLITE_FCNTL_PERSIST_WAL => ffi::SQLITE_NOTFOUND,
+            // Enable or disable the persistent WAL setting.
+            ffi::SQLITE_FCNTL_PERSIST_WAL => {
+                if let Some(p_arg) = (p_arg as *mut i32).as_mut() {
+                    if *p_arg < 0 {
+                        // query current setting
+                        *p_arg = state.persist_wal as i32;
+                    } else {
+                        state.persist_wal = *p_arg == 1;
+                    }
+                };
+
+                ffi::SQLITE_OK
+            }
 
             // Indicate that, unless it is rolled back for some reason, the entire database file
             // will be overwritten by the current transaction. Not implemented.
