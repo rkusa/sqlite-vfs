@@ -10,7 +10,7 @@ test: test-vfs/.dockerbuild
 		--mount type=tmpfs,destination=/home/sqlite/build/testdir \
 		-e RUST_LOG=${RUST_LOG} \
 		-t sqlite-vfs-test \
-		test/quick.test
+		test/full.test
 
 test-vfs/.dockerbuild: test-vfs/Dockerfile test-vfs/entrypoint.sh test-vfs/docker/test-vfs/Cargo.toml test-vfs/patch.sh test-vfs/patch/* test-vfs/patch/test/* test-vfs/docker/test-vfs/src/*.rs
 	docker build --platform $(PLATFORM) \
