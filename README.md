@@ -17,6 +17,7 @@ This library is still in _prototype_ state and not ready to be used (except for 
 
 ## Limitations
 
+- WAL is not supported (but in progress)
 - Memory mapping not supported (`xFetch`/`xUnfetch`)
 - Loading extensions not supported (`xDl*`)
 - Tests run only on UNIX right now (due to `std::os::unix` usage in tests)
