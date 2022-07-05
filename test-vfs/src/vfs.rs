@@ -5,7 +5,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sqlite_vfs::{LockKind, OpenAccess, OpenKind, OpenOptions, Vfs, WalIndex, WalIndexLock};
+use sqlite_vfs::wip::WalIndex;
+use sqlite_vfs::{LockKind, OpenAccess, OpenKind, OpenOptions, Vfs, WalIndexLock};
 
 use crate::file_lock::FileLock;
 use crate::lock::Lock;

@@ -22,7 +22,7 @@ mod ffi;
 /// A file opened by [Vfs].
 pub trait DatabaseHandle: Sync {
     /// An optional trait used to store a WAL (write-ahead log).
-    type WalIndex: WalIndex;
+    type WalIndex: wip::WalIndex;
 
     /// Return the current size in bytes of the database.
     fn size(&self) -> Result<u64, std::io::Error>;
@@ -101,21 +101,26 @@ pub trait Vfs: Sync {
     }
 }
 
-pub trait WalIndex: Sync {
-    fn enabled() -> bool {
-        true
-    }
+#[doc(hidden)]
+pub mod wip {
+    use super::*;
 
-    fn map(&mut self, region: u32) -> Result<[u8; 32768], std::io::Error>;
-    fn lock(&mut self, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, std::io::Error>;
-    fn delete(self) -> Result<(), std::io::Error>;
+    pub trait WalIndex: Sync {
+        fn enabled() -> bool {
+            true
+        }
 
-    fn pull(&mut self, _region: u32, _data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
-        Ok(())
-    }
+        fn map(&mut self, region: u32) -> Result<[u8; 32768], std::io::Error>;
+        fn lock(&mut self, locks: Range<u8>, lock: WalIndexLock) -> Result<bool, std::io::Error>;
+        fn delete(self) -> Result<(), std::io::Error>;
 
-    fn push(&mut self, _region: u32, _data: &[u8; 32768]) -> Result<(), std::io::Error> {
-        Ok(())
+        fn pull(&mut self, _region: u32, _data: &mut [u8; 32768]) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        fn push(&mut self, _region: u32, _data: &[u8; 32768]) -> Result<(), std::io::Error> {
+            Ok(())
+        }
     }
 }
 
@@ -883,6 +888,7 @@ mod io {
     use std::mem;
 
     use super::*;
+    use wip::WalIndex;
 
     /// Close a file.
     pub unsafe extern "C" fn close<V: Vfs, F: DatabaseHandle>(
@@ -1976,7 +1982,7 @@ impl Default for LockKind {
 #[derive(Default)]
 pub struct WalDisabled;
 
-impl WalIndex for WalDisabled {
+impl wip::WalIndex for WalDisabled {
     fn enabled() -> bool {
         false
     }
