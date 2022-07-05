@@ -43,4 +43,6 @@ rm test/symlink.test
 rm test/wal5.test
 rm test/wal6.test
 rm test/walro.test
+rm test/walro2.test
 rm test/walthread.test
+rm test/walvfs.test
