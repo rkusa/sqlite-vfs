@@ -147,6 +147,10 @@ impl Vfs for TestVfs {
             .to_string()
             .into())
     }
+
+    fn random(&self, buffer: &mut [i8]) {
+        rand::Rng::fill(&mut rand::thread_rng(), buffer);
+    }
 }
 
 impl sqlite_vfs::DatabaseHandle for Connection {

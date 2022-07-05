@@ -90,6 +90,9 @@ pub trait Vfs: Sync {
     /// Generate and return a path for a temporary database.
     fn temporary_name(&self) -> String;
 
+    /// Populate the `buffer` with random data.
+    fn random(&self, buffer: &mut [i8]);
+
     /// Check access to `db`. The default implementation always returns `true`.
     fn access(&self, _db: &str, _write: bool) -> Result<bool, std::io::Error> {
         Ok(true)
@@ -276,7 +279,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xDlError: Some(vfs::dlerror::<V>),
         xDlSym: Some(vfs::dlsym::<V>),
         xDlClose: Some(vfs::dlclose::<V>),
-        xRandomness: Some(vfs::randomness),
+        xRandomness: Some(vfs::randomness::<V>),
         xSleep: Some(vfs::sleep),
         xCurrentTime: Some(vfs::current_time::<V>),
         xGetLastError: Some(vfs::get_last_error::<V>),
@@ -737,19 +740,24 @@ mod vfs {
     }
 
     /// Populate the buffer pointed to by `z_buf_out` with `n_byte` bytes of random data.
-    pub unsafe extern "C" fn randomness(
-        _p_vfs: *mut ffi::sqlite3_vfs,
+    pub unsafe extern "C" fn randomness<V: Vfs>(
+        p_vfs: *mut ffi::sqlite3_vfs,
         n_byte: c_int,
         z_buf_out: *mut c_char,
     ) -> c_int {
         log::trace!("randomness");
 
-        let bytes = slice::from_raw_parts_mut(z_buf_out, n_byte as usize);
+        let bytes = slice::from_raw_parts_mut(z_buf_out as *mut i8, n_byte as usize);
         if cfg!(feature = "sqlite_test") {
             // During testing, the buffer is simply initialized to all zeroes for repeatability
             bytes.fill(0);
         } else {
-            rand::Rng::fill(&mut rand::thread_rng(), bytes)
+            let state = match vfs_state::<V>(p_vfs) {
+                Ok(state) => state,
+                Err(_) => return 0,
+            };
+
+            state.vfs.random(bytes);
         }
         bytes.len() as c_int
     }

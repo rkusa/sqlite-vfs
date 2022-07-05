@@ -14,7 +14,6 @@ members = ["test-vfs"]
 
 [dependencies]
 log = "0.4"
-rand = "0.8"
 time = "0.3"
 
 [features]
