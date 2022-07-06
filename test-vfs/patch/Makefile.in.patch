@@ -1,0 +1,20 @@
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -193,7 +193,7 @@ LIBOBJS0 = alter.lo analyze.lo attach.lo auth.lo \
+          vdbe.lo vdbeapi.lo vdbeaux.lo vdbeblob.lo vdbemem.lo vdbesort.lo \
+          vdbetrace.lo vdbevtab.lo \
+          wal.lo walker.lo where.lo wherecode.lo whereexpr.lo \
+-         window.lo utf.lo vtab.lo
++         window.lo utf.lo vtab.lo test_ext.lo
+
+ # Object files for the amalgamation.
+ #
+@@ -966,6 +966,9 @@ status.lo:	$(TOP)/src/status.c $(HDR)
+ table.lo:	$(TOP)/src/table.c $(HDR)
+ 	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/table.c
+
++test_ext.lo:	$(TOP)/src/test_ext.c $(HDR)
++	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/test_ext.c
++
+ threads.lo:	$(TOP)/src/threads.c $(HDR)
+ 	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/threads.c

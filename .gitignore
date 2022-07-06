@@ -1,6 +1,9 @@
 .*
 !.gitignore
-/target
+!.github
+!.dockerignore
+target
 wasm-pack.log
 build/
 /db
+/test-vfs/sqlite
