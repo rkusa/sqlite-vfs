@@ -151,6 +151,15 @@ impl Vfs for TestVfs {
     fn random(&self, buffer: &mut [i8]) {
         rand::Rng::fill(&mut rand::thread_rng(), buffer);
     }
+
+    fn sleep(&self, duration: std::time::Duration) -> std::time::Duration {
+        std::thread::sleep(duration);
+
+        // Well, this function is only supposed to sleep at least `n_micro`μs, but there are
+        // tests that expect the return to match exactly `n_micro`. As those tests are flaky as
+        // a result, we are cheating here.
+        duration
+    }
 }
 
 impl sqlite_vfs::DatabaseHandle for Connection {

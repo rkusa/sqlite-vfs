@@ -13,9 +13,7 @@ use std::pin::Pin;
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 mod ffi;
 
@@ -92,6 +90,9 @@ pub trait Vfs: Sync {
 
     /// Populate the `buffer` with random data.
     fn random(&self, buffer: &mut [i8]);
+
+    /// Sleep for `duration`. Return the duration actually slept.
+    fn sleep(&self, duration: Duration) -> Duration;
 
     /// Check access to `db`. The default implementation always returns `true`.
     fn access(&self, _db: &str, _write: bool) -> Result<bool, std::io::Error> {
@@ -280,7 +281,7 @@ pub fn register<F: DatabaseHandle, V: Vfs<Handle = F>>(
         xDlSym: Some(vfs::dlsym::<V>),
         xDlClose: Some(vfs::dlclose::<V>),
         xRandomness: Some(vfs::randomness::<V>),
-        xSleep: Some(vfs::sleep),
+        xSleep: Some(vfs::sleep::<V>),
         xCurrentTime: Some(vfs::current_time::<V>),
         xGetLastError: Some(vfs::get_last_error::<V>),
         xCurrentTimeInt64: Some(vfs::current_time_int64::<V>),
@@ -763,19 +764,17 @@ mod vfs {
     }
 
     /// Sleep for `n_micro` microseconds. Return the number of microseconds actually slept.
-    pub unsafe extern "C" fn sleep(_p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
+    pub unsafe extern "C" fn sleep<V: Vfs>(p_vfs: *mut ffi::sqlite3_vfs, n_micro: c_int) -> c_int {
         log::trace!("sleep");
 
-        let instant = Instant::now();
-        thread::sleep(Duration::from_micros(n_micro as u64));
-        if cfg!(feature = "sqlite_test") {
-            // Well, this function is only supposed to sleep at least `n_micro`μs, but there are
-            // tests that expect the return to match exactly `n_micro`. As those tests are flaky as
-            // a result, we are cheating here.
-            n_micro
-        } else {
-            instant.elapsed().as_micros() as c_int
-        }
+        let state = match vfs_state::<V>(p_vfs) {
+            Ok(state) => state,
+            Err(_) => return ffi::SQLITE_ERROR,
+        };
+        state
+            .vfs
+            .sleep(Duration::from_micros(n_micro as u64))
+            .as_micros() as c_int
     }
 
     /// Return the current time as a Julian Day number in `p_time_out`.
