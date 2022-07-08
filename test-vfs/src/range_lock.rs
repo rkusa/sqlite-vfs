@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::{env, io};
 
-use sqlite_vfs::WalIndexLock as LockKind;
+use sqlite_vfs::wip::WalIndexLock as LockKind;
 
 use crate::file_lock::FileLock;
 use crate::lock::{flock_exclusive, flock_shared, flock_unlock};
