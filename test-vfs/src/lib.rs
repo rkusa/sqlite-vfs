@@ -13,7 +13,6 @@ pub extern "C" fn sqlite3_register_test_vfs() -> i32 {
     pretty_env_logger::try_init().ok();
     // pretty_env_logger::formatted_builder()
     //     .filter(Some("sqlite_vfs"), log::LevelFilter::Trace)
-    //     .filter(Some("durable_object"), log::LevelFilter::Error)
     //     .try_init()
     //     .ok();
 

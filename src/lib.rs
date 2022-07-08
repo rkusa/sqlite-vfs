@@ -35,14 +35,14 @@ pub trait DatabaseHandle: Sync {
     /// `true`, only the data and not the metadata (like size, access time, etc) should be synced.
     fn sync(&mut self, data_only: bool) -> Result<(), std::io::Error>;
 
-    /// Set the database file to the specified `size`. Truncates or extends the underlying stroage.
+    /// Set the database file to the specified `size`. Truncates or extends the underlying storage.
     fn set_len(&mut self, size: u64) -> Result<(), std::io::Error>;
 
-    /// Lock the database. Returns whether the requested lock could be aquired.
+    /// Lock the database. Returns whether the requested lock could be acquired.
     /// Locking sequence:
-    /// - The lock is nevered moved from [Lock::None] to anything higher than [Lock::Shared].
-    /// - A [Lock::Pending] is never requested explicitly.
-    /// - A [Lock::Shared] is always held when a [Lock::Reserved] lock is requested
+    /// - The lock is never moved from [LockKind::None] to anything higher than [LockKind::Shared].
+    /// - A [LockKind::Pending] is never requested explicitly.
+    /// - A [LockKind::Shared] is always held when a [LockKind::Reserved] lock is requested
     fn lock(&mut self, lock: LockKind) -> Result<bool, std::io::Error>;
 
     /// Unlock the database.
@@ -50,11 +50,11 @@ pub trait DatabaseHandle: Sync {
         self.lock(lock)
     }
 
-    /// Check if the database this handle points to holds a [Lock::Reserved], [Lock::Pending] or
-    /// [Lock::Exclusive] lock.
+    /// Check if the database this handle points to holds a [LockKind::Reserved],
+    /// [LockKind::Pending] or [LockKind::Exclusive] lock.
     fn reserved(&mut self) -> Result<bool, std::io::Error>;
 
-    /// Return the current [Lock] of the this handle.
+    /// Return the current [LockKind] of the this handle.
     fn current_lock(&self) -> Result<LockKind, std::io::Error>;
 
     /// Change the chunk size of the database to `chunk_size`.
@@ -108,6 +108,14 @@ pub trait Vfs: Sync {
 #[doc(hidden)]
 pub mod wip {
     use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u16)]
+    pub enum WalIndexLock {
+        None = 1,
+        Shared,
+        Exclusive,
+    }
 
     pub trait WalIndex: Sync {
         fn enabled() -> bool {
@@ -178,39 +186,31 @@ pub enum LockKind {
     /// This is the default state.
     None,
 
-    /// The database may be read but not written. Any number of processes can hold [Lock::Shared]
-    /// locks at the same time, hence there can be many simultaneous readers. But no other thread or
-    /// process is allowed to write to the database file while one or more [Lock::Shared] locks are
-    /// active.
+    /// The database may be read but not written. Any number of processes can hold
+    /// [LockKind::Shared] locks at the same time, hence there can be many simultaneous readers. But
+    /// no other thread or process is allowed to write to the database file while one or more
+    /// [LockKind::Shared] locks are active.
     Shared,
 
-    /// A [Lock::Reserved] lock means that the process is planning on writing to the database file
-    /// at some point in the future but that it is currently just reading from the file. Only a
-    /// single [Lock::Reserved] lock may be active at one time, though multiple [Lock::Shared] locks
-    /// can coexist with a single [Lock::Reserved] lock. [Lock::Reserved] differs from
-    /// [Lock::Pending] in that new [Lock::Shared] locks can be acquired while there is a
-    /// [Lock::Reserved] lock.
+    /// A [LockKind::Reserved] lock means that the process is planning on writing to the database
+    /// file at some point in the future but that it is currently just reading from the file. Only a
+    /// single [LockKind::Reserved] lock may be active at one time, though multiple
+    /// [LockKind::Shared] locks can coexist with a single [LockKind::Reserved] lock.
+    /// [LockKind::Reserved] differs from [LockKind::Pending] in that new [LockKind::Shared] locks
+    /// can be acquired while there is a [LockKind::Reserved] lock.
     Reserved,
 
-    /// A [Lock::Pending] lock means that the process holding the lock wants to write to the
-    /// database as soon as possible and is just waiting on all current [Lock::Shared] locks to
-    /// clear so that it can get an [Lock::Exclusive] lock. No new [Lock::Shared] locks are
-    /// permitted against the database if a [Lock::Pending] lock is active, though existing
-    /// [Lock::Shared] locks are allowed to continue.
+    /// A [LockKind::Pending] lock means that the process holding the lock wants to write to the
+    /// database as soon as possible and is just waiting on all current [LockKind::Shared] locks to
+    /// clear so that it can get an [LockKind::Exclusive] lock. No new [LockKind::Shared] locks are
+    /// permitted against the database if a [LockKind::Pending] lock is active, though existing
+    /// [LockKind::Shared] locks are allowed to continue.
     Pending,
 
-    /// An [Lock::Exclusive] lock is needed in order to write to the database file. Only one
-    /// [Lock::Exclusive] lock is allowed on the file and no other locks of any kind are allowed to
-    /// coexist with an [Lock::Exclusive] lock. In order to maximize concurrency, SQLite works to
-    /// minimize the amount of time that [Lock::Exclusive] locks are held.
-    Exclusive,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum WalIndexLock {
-    None = 1,
-    Shared,
+    /// An [LockKind::Exclusive] lock is needed in order to write to the database file. Only one
+    /// [LockKind::Exclusive] lock is allowed on the file and no other locks of any kind are allowed
+    /// to coexist with an [LockKind::Exclusive] lock. In order to maximize concurrency, SQLite
+    /// works to minimize the amount of time that [LockKind::Exclusive] locks are held.
     Exclusive,
 }
 
@@ -333,7 +333,7 @@ struct FileExt<V, F: DatabaseHandle> {
     last_errno: i32,
     wal_index: Option<(F::WalIndex, bool)>,
     wal_index_regions: HashMap<u32, Pin<Box<[u8; 32768]>>>,
-    wal_index_locks: HashMap<u8, WalIndexLock>,
+    wal_index_locks: HashMap<u8, wip::WalIndexLock>,
     has_exclusive_lock: bool,
     id: usize,
     chunk_size: Option<usize>,
@@ -1114,7 +1114,7 @@ mod io {
                     let has_exclusive_wal_index = state
                         .wal_index_locks
                         .iter()
-                        .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+                        .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
 
                     if !has_exclusive_wal_index {
                         log::trace!(
@@ -1177,7 +1177,7 @@ mod io {
         }
     }
 
-    /// Check if another file-handle holds a [Lock::Reserved] lock on a file.
+    /// Check if another file-handle holds a [LockKind::Reserved] lock on a file.
     pub unsafe extern "C" fn check_reserved_lock<V, F: DatabaseHandle>(
         p_file: *mut ffi::sqlite3_file,
         p_res_out: *mut c_int,
@@ -1632,9 +1632,9 @@ mod io {
 
         let range = offset as u8..(offset + n) as u8;
         let lock = match (locking, exclusive) {
-            (true, true) => WalIndexLock::Exclusive,
-            (true, false) => WalIndexLock::Shared,
-            (false, _) => WalIndexLock::None,
+            (true, true) => wip::WalIndexLock::Exclusive,
+            (true, false) => wip::WalIndexLock::Shared,
+            (false, _) => wip::WalIndexLock::None,
         };
 
         let (wal_index, readonly) = match state.wal_index.as_mut() {
@@ -1654,7 +1654,7 @@ mod io {
             let has_exclusive = state
                 .wal_index_locks
                 .iter()
-                .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+                .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
 
             if !has_exclusive {
                 log::trace!(
@@ -1668,10 +1668,9 @@ mod io {
                 }
             }
         } else {
-            let releases_any_exclusive = state
-                .wal_index_locks
-                .iter()
-                .any(|(region, lock)| *lock == WalIndexLock::Exclusive && range.contains(region));
+            let releases_any_exclusive = state.wal_index_locks.iter().any(|(region, lock)| {
+                *lock == wip::WalIndexLock::Exclusive && range.contains(region)
+            });
 
             // push index changes when moving from any exclusive lock to no exclusive locks
             if releases_any_exclusive && !readonly {
@@ -1730,7 +1729,7 @@ mod io {
         let has_exclusive = state
             .wal_index_locks
             .iter()
-            .any(|(_, lock)| *lock == WalIndexLock::Exclusive);
+            .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
 
         if !has_exclusive {
             log::trace!(
@@ -1998,7 +1997,11 @@ impl wip::WalIndex for WalDisabled {
         Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
     }
 
-    fn lock(&mut self, _locks: Range<u8>, _lock: WalIndexLock) -> Result<bool, std::io::Error> {
+    fn lock(
+        &mut self,
+        _locks: Range<u8>,
+        _lock: wip::WalIndexLock,
+    ) -> Result<bool, std::io::Error> {
         Err(std::io::Error::new(ErrorKind::Other, "wal is disabled"))
     }
 

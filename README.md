@@ -2,7 +2,7 @@
 
 Build SQLite virtual file systems (VFS) by implementing a simple Rust trait.
 
-[Documentation](https://docs.rs/sqlite-vfs) | [Example](https://github.com/rkusa/sqlite-vfs/blob/main/examples/fs.rs)
+[Documentation](https://docs.rs/sqlite-vfs) | [Example](https://github.com/rkusa/wasm-sqlite/blob/main/wasm/src/vfs.rs)
 
 This library is build for my own use-case. It doesn't expose everything a SQLite VFS provides (e.g. memory mapped files). Feel free to propose additions if the current state doesn't work for your use-case.
 
