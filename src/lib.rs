@@ -1712,28 +1712,26 @@ mod io {
             return;
         };
 
-        if state.has_exclusive_lock && !readonly {
+        let has_exclusive_wal = state
+            .wal_index_locks
+            .iter()
+            .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
+
+        if (state.has_exclusive_lock || has_exclusive_wal) && !readonly {
             log::trace!(
-                "[{}] has exclusive db lock, pushing wal index changes",
+                "[{}] has exclusive lock (db={} wal={}), pushing wal index changes",
                 state.id,
+                state.has_exclusive_lock,
+                has_exclusive_wal,
             );
             for (region, data) in &mut state.wal_index_regions {
                 if let Err(err) = wal_index.push(*region as u32, data) {
                     log::error!("[{}] pushing wal index changes failed: {}", state.id, err)
                 }
             }
-
-            return;
-        }
-
-        let has_exclusive = state
-            .wal_index_locks
-            .iter()
-            .any(|(_, lock)| *lock == wip::WalIndexLock::Exclusive);
-
-        if !has_exclusive {
+        } else {
             log::trace!(
-                "[{}] does not have wal index write lock, pulling changes",
+                "[{}] does not have exclusive lock, pulling changes",
                 state.id
             );
             for (region, data) in &mut state.wal_index_regions {
