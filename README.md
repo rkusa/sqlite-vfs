@@ -8,14 +8,13 @@ This library is build for my own use-case. It doesn't expose everything a SQLite
 
 ## Status
 
-This library is still in _prototype_ state and not ready to be used (except for maybe prototypes). While progress will be slow, it is actively worked on.
+Please note: This project is a _prototype_. It is neither intended for production environments nor subject to active development.
 
 - ✅ It passes most of SQLite's TCL test harness.
   - ⚠️ CI only runs `full.test` and not `all.test`.
   - ⚠️ [Some tests](./test-vfs/patch.sh) are skipped.
 - ✅ Successfully runs experiments like [`do-sqlite`](https://github.com/rkusa/do-sqlite).
 - ⚠️ It uses `unsafe` Rust, which hasn't been peer-reviewed yet.
-- ⚠️ It is not used in any production-capacity yet.
 
 ## Limitations
 
